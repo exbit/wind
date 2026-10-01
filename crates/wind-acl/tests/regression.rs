@@ -214,6 +214,154 @@ fn chain_jump_returns_to_caller() {
 }
 
 #[test]
+fn chain_control_verdicts_are_distinguishable() {
+	// One ruleset exercising all three control-flow verdicts (spec §5):
+	//  - `Return` pops out of the chain it was evaluated in, so in the entry
+	//    chain it reaches the entry policy instead of resuming the scan.
+	//  - `Goto` is a tail call whose target's non-terminal result is a
+	//    fallthrough at the call site, so the caller keeps scanning.
+	//  - `Jump` returns to the caller at the rule after the jump.
+	let rs = Ruleset {
+		sets: vec![],
+		maps: vec![],
+		entry: 0,
+		chains: vec![
+			wind_acl::Chain {
+				name: "main".into(),
+				policy: Verdict::Forward("main-policy".into()),
+				rules: vec![
+					port_rule(80, Verdict::Return),
+					// Reached only if rule 1 resumes the scan, so it must not run.
+					port_rule(80, Verdict::Forward("after-return".into())),
+					port_rule(81, Verdict::Goto("leaf".into())),
+					port_rule(81, Verdict::Forward("after-goto".into())),
+					port_rule(82, Verdict::Jump("leaf".into())),
+					port_rule(82, Verdict::Forward("after-jump".into())),
+					port_rule(83, Verdict::Forward("direct".into())),
+				],
+			},
+			wind_acl::Chain {
+				name: "leaf".into(),
+				policy: Verdict::Forward("leaf-policy".into()),
+				// No rule matches the ports above, so the leaf falls through.
+				rules: vec![port_rule(999, Verdict::Forward("leaf-hit".into()))],
+			},
+		],
+	};
+
+	// Return -> entry policy, without running the later rule for the same key.
+	assert_eq!(decision_norm(&rs, 80), "forward:main-policy");
+	// Goto -> target falls through -> caller continues -> after-goto.
+	assert_eq!(decision_norm(&rs, 81), "forward:after-goto");
+	// Jump -> target falls through -> caller continues -> after-jump.
+	assert_eq!(decision_norm(&rs, 82), "forward:after-jump");
+	// A plain terminal verdict is unaffected.
+	assert_eq!(decision_norm(&rs, 83), "forward:direct");
+	// A port that matches nothing is a plain fallthrough to the policy.
+	assert_eq!(decision_norm(&rs, 999), "forward:main-policy");
+}
+
+#[test]
+fn chain_return_in_a_callee_runs_the_caller_rule_after_the_jump() {
+	// main: Jump sub, then after-jump; sub: Return, then sub-later-rule.
+	// The callee's remaining rules must not run and its policy must not apply.
+	let rs = Ruleset {
+		sets: vec![],
+		maps: vec![],
+		entry: 0,
+		chains: vec![
+			wind_acl::Chain {
+				name: "main".into(),
+				policy: Verdict::Forward("main-policy".into()),
+				rules: vec![
+					port_rule(80, Verdict::Jump("sub".into())),
+					port_rule(80, Verdict::Forward("after-jump".into())),
+				],
+			},
+			wind_acl::Chain {
+				name: "sub".into(),
+				policy: Verdict::Forward("sub-policy".into()),
+				rules: vec![
+					port_rule(80, Verdict::Return),
+					port_rule(80, Verdict::Forward("sub-later-rule".into())),
+				],
+			},
+		],
+	};
+
+	assert_eq!(decision_norm(&rs, 80), "forward:after-jump");
+}
+
+#[test]
+fn chain_return_from_a_verdict_map_default_pops_the_chain() {
+	// A `Return` reached through a map default must pop the rule's chain as
+	// well, not resume scanning it.
+	let rs = Ruleset {
+		sets: vec![],
+		maps: vec![wind_acl::VerdictMap {
+			side: Side::Dst,
+			field: MapField::Port,
+			entries: vec![],
+			default: Some(Verdict::Return),
+		}],
+		entry: 0,
+		chains: vec![wind_acl::Chain {
+			name: "main".into(),
+			policy: Verdict::Forward("policy".into()),
+			rules: vec![
+				rule(Match::Always, Verdict::Map(0)),
+				rule(Match::Always, Verdict::Forward("later-rule".into())),
+			],
+		}],
+	};
+
+	assert_eq!(decision_norm(&rs, 80), "forward:policy");
+}
+
+#[test]
+fn exhausted_entry_chain_applies_the_entry_policy() {
+	let rs = Ruleset {
+		sets: vec![],
+		maps: vec![],
+		entry: 0,
+		chains: vec![wind_acl::Chain {
+			name: "main".into(),
+			policy: Verdict::Reject("no match".into()),
+			rules: vec![port_rule(443, Verdict::Forward("https".into()))],
+		}],
+	};
+
+	assert_eq!(decision_norm(&rs, 443), "forward:https");
+	assert_eq!(decision_norm(&rs, 80), "reject");
+}
+
+#[test]
+fn max_chain_depth_bounds_a_goto_cycle() {
+	// `MAX_CHAIN_DEPTH` must still cut a `Goto` cycle instead of recursing
+	// without bound; the cut is reported as fallthrough, which the entry chain
+	// turns into its policy.
+	let rs = Ruleset {
+		sets: vec![],
+		maps: vec![],
+		entry: 0,
+		chains: vec![
+			wind_acl::Chain {
+				name: "a".into(),
+				policy: Verdict::Forward("a-policy".into()),
+				rules: vec![rule(Match::Always, Verdict::Goto("b".into()))],
+			},
+			wind_acl::Chain {
+				name: "b".into(),
+				policy: Verdict::Forward("b-policy".into()),
+				rules: vec![rule(Match::Always, Verdict::Goto("a".into()))],
+			},
+		],
+	};
+
+	assert_eq!(decision_norm(&rs, 80), "forward:a-policy");
+}
+
+#[test]
 fn verdict_map_dispatch() {
 	let rs = Ruleset {
 		sets: vec![],
@@ -251,6 +399,30 @@ fn rule(matches: Match, verdict: Verdict) -> wind_acl::IrRule {
 		matches,
 		stmts: vec![],
 		verdict,
+	}
+}
+
+/// A destination-port rule; a single port is `p..=p`.
+fn port_rule(port: u16, verdict: Verdict) -> wind_acl::IrRule {
+	rule(
+		Match::Port {
+			side: Side::Dst,
+			range: port..=port,
+		},
+		verdict,
+	)
+}
+
+/// Route by destination port and render the decision as a string, so a failing
+/// chain-control assertion shows which verdict was applied.
+fn decision_norm(rs: &Ruleset, port: u16) -> String {
+	let ctx = MatchContext {
+		dst_port: Some(port),
+		..Default::default()
+	};
+	match rs.route(&ctx) {
+		RouteAction::Forward(o) => format!("forward:{o}"),
+		RouteAction::Reject(_) => "reject".to_string(),
 	}
 }
 
