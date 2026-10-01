@@ -162,6 +162,20 @@ impl QuicheAcceptor {
 	}
 }
 
+/// Take the connection stream `tokio_quiche::listen` produced for a listening
+/// socket.
+///
+/// `listen` yields one stream per input socket and [`bind_server`] passes
+/// exactly one, so this cannot fail today; returning an error instead of
+/// indexing the list keeps a future zero-socket call from panicking.
+fn take_listener<M: tokio_quiche::metrics::Metrics>(
+	mut listeners: Vec<tokio_quiche::QuicConnectionStream<M>>,
+) -> Result<tokio_quiche::QuicConnectionStream<M>, QuicError> {
+	listeners
+		.pop()
+		.ok_or_else(|| QuicError::Endpoint("tokio-quiche listen returned no connection stream".into()))
+}
+
 /// Bind a quiche server listener on `addr`.
 ///
 /// The quiche backend loads TLS credentials from file paths, so `tls_cfg` must
@@ -210,9 +224,9 @@ pub async fn bind_server(
 		hooks,
 	);
 
-	let mut listeners = tokio_quiche::listen([socket], params, DefaultMetrics)
+	let listeners = tokio_quiche::listen([socket], params, DefaultMetrics)
 		.map_err(|e| QuicError::Endpoint(format!("tokio-quiche listen: {e}")))?;
-	let mut stream = listeners.remove(0);
+	let mut stream = take_listener(listeners)?;
 
 	let (conn_tx, conn_rx) = mpsc::unbounded_channel();
 
@@ -363,5 +377,14 @@ mod tests {
 		assert_eq!(s.initial_max_stream_data_uni, 5 * MIB);
 		assert_eq!(s.max_connection_window, defaults.max_connection_window);
 		assert_eq!(s.max_stream_window, defaults.max_stream_window);
+	}
+
+	#[test]
+	fn an_empty_listener_list_is_an_error_instead_of_a_panic() {
+		// `bind_server` binds one socket, so `listen` always yields one
+		// stream; this pins the guard that turns a future zero-socket call
+		// into an `Err` rather than a panic on the empty listener list.
+		let empty: Vec<tokio_quiche::QuicConnectionStream<DefaultMetrics>> = Vec::new();
+		assert!(matches!(take_listener(empty), Err(QuicError::Endpoint(_))));
 	}
 }
