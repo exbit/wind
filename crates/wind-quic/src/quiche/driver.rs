@@ -647,13 +647,15 @@ fn export_keying_material(qconn: &mut QuicheConnection, out_len: usize, label: &
 
 	let ssl: &mut boring::ssl::SslRef = qconn.as_mut();
 	let mut out = vec![0u8; out_len];
-	// SAFETY: `ssl.as_ptr()` yields a valid `SSL*` for the borrow; `out` /
+	let mut scratch = 0u8;
+	let out_ptr = export_out_ptr(&mut out, &mut scratch);
+	// SAFETY: `ssl.as_ptr()` yields a valid `SSL*` for the borrow; `out_ptr` /
 	// `label` / `context` are passed as (ptr, len) of valid slices and
 	// BoringSSL does not retain them past the call.
 	let rc = unsafe {
 		boring_sys::SSL_export_keying_material(
 			ssl.as_ptr(),
-			out.as_mut_ptr(),
+			out_ptr,
 			out.len(),
 			label.as_ptr() as *const core::ffi::c_char,
 			label.len(),
@@ -663,6 +665,22 @@ fn export_keying_material(qconn: &mut QuicheConnection, out_len: usize, label: &
 		)
 	};
 	(rc == 1).then_some(out)
+}
+
+/// The `out` pointer to hand `SSL_export_keying_material` for an export of
+/// `out.len()` bytes.
+///
+/// BoringSSL takes `out` as a pointer valid for `out_len` bytes. A
+/// zero-capacity `Vec` has no allocation, so its `as_mut_ptr` is a dangling —
+/// merely non-null — pointer that must not reach the FFI. A zero-length export
+/// is backed by `scratch` instead; the exporter writes nothing at that length,
+/// so the observable output is unchanged.
+fn export_out_ptr(out: &mut [u8], scratch: &mut u8) -> *mut u8 {
+	if out.is_empty() {
+		core::ptr::from_mut(scratch)
+	} else {
+		out.as_mut_ptr()
+	}
 }
 
 impl ApplicationOverQuic for BridgeDriver {
@@ -892,5 +910,46 @@ impl ApplicationOverQuic for BridgeDriver {
 		self.shared.recv_bytes.store(stats.recv_bytes, Ordering::Relaxed);
 		self.shared.closed.store(true, Ordering::SeqCst);
 		self.shared.closed_notify.notify_waiters();
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::export_out_ptr;
+
+	#[test]
+	fn a_zero_length_export_does_not_pass_a_dangling_pointer() {
+		// A zero-capacity `Vec` has no allocation, so `as_mut_ptr` is a
+		// dangling (non-null) pointer; the pre-fix code handed exactly
+		// that to `SSL_export_keying_material` whenever the caller
+		// exported zero bytes.
+		let mut out: Vec<u8> = Vec::new();
+		let mut scratch = 0u8;
+		let ptr = export_out_ptr(&mut out, &mut scratch);
+		assert_eq!(
+			ptr,
+			core::ptr::from_mut(&mut scratch),
+			"a zero-length export must hand BoringSSL a dereferenceable pointer"
+		);
+		assert_ne!(
+			ptr,
+			out.as_mut_ptr(),
+			"the empty buffer's dangling pointer must never reach the FFI call"
+		);
+		// The pointer really is writable even though a zero-length export
+		// writes nothing into it.
+		unsafe { ptr.write(0xA5) };
+		assert_eq!(scratch, 0xA5);
+	}
+
+	#[test]
+	fn a_non_empty_export_still_uses_the_callers_own_buffer() {
+		let mut out = [0u8; 32];
+		let mut scratch = 0u8;
+		assert_eq!(
+			export_out_ptr(&mut out, &mut scratch),
+			out.as_mut_ptr(),
+			"a non-empty export must write into the caller's buffer"
+		);
 	}
 }

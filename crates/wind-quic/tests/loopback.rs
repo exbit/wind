@@ -330,6 +330,52 @@ async fn quiche_reset_visibility() {
 	run_reset_visibility(server_conn, client_conn).await;
 }
 
+/// A zero-length keying-material export must still reach the TLS exporter and
+/// succeed on the quiche backend.
+///
+/// The driver passes the caller's buffer to `SSL_export_keying_material` as a
+/// `(ptr, len)` pair, so a zero-length export used to hand it a dangling
+/// pointer (a zero-capacity `Vec` has no allocation). That only happened not to
+/// fault because BoringSSL's HKDF expansion loop never runs for a zero length.
+/// This test drives the whole path — including the FFI call — with an empty
+/// buffer.
+#[cfg(feature = "quiche")]
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn quiche_zero_length_export_succeeds() {
+	use wind_quic::quiche;
+
+	const LABEL: &[u8] = b"wind-quic-zero-length-export";
+	const CONTEXT: &[u8] = b"wind-quic-zero-length-context";
+
+	let (_dir, cert, key) = write_self_signed();
+	let (server_tls, client_tls, transport) = configs(&cert, &key);
+
+	let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+	let mut acceptor = quiche::bind_server(addr, &server_tls, &transport, None)
+		.await
+		.expect("bind_server");
+	let local = acceptor.local_addr();
+
+	let server_fut = async move { acceptor.accept().await.expect("server conn") };
+	let client_fut = quiche::connect(local, &client_tls, &transport);
+	let (server_conn, client_conn) = tokio::join!(server_fut, client_fut);
+	let client_conn = client_conn.expect("client connect");
+
+	let mut s_out: [u8; 0] = [];
+	let mut c_out: [u8; 0] = [];
+	server_conn
+		.export_keying_material(&mut s_out, LABEL, CONTEXT)
+		.await
+		.expect("server export of zero bytes");
+	client_conn
+		.export_keying_material(&mut c_out, LABEL, CONTEXT)
+		.await
+		.expect("client export of zero bytes");
+
+	client_conn.close(0, b"done");
+	let _ = tokio::time::timeout(Duration::from_secs(2), client_conn.closed()).await;
+}
+
 /// Regression: per-user traffic accounting samples `byte_stats()` one final
 /// time when the connection closes. That read must still return the final
 /// `(sent, recv)` *after* the connection has closed and its driver worker has
