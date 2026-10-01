@@ -426,3 +426,56 @@ async fn quiche_byte_stats_survives_close() {
 
 	byte_stats_survives_close(server_conn, client_conn).await;
 }
+
+/// The quiche client must bind its local UDP socket on the peer's address
+/// family. It used to always bind `0.0.0.0:0`, so dialing an IPv6 peer failed
+/// with an address-family mismatch before the handshake could start.
+#[cfg(feature = "quiche")]
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn quiche_connects_to_ipv6_peer() {
+	use wind_quic::quiche;
+
+	// Some environments have IPv6 disabled; that is not this test's subject.
+	if tokio::net::UdpSocket::bind("[::1]:0").await.is_err() {
+		eprintln!("skipping quiche_connects_to_ipv6_peer: no IPv6 loopback on this host");
+		return;
+	}
+
+	let (_dir, cert, key) = write_self_signed();
+	let (server_tls, client_tls, transport) = configs(&cert, &key);
+
+	let addr: SocketAddr = "[::1]:0".parse().unwrap();
+	let mut acceptor = quiche::bind_server(addr, &server_tls, &transport, None)
+		.await
+		.expect("bind_server on [::1]");
+	let local = acceptor.local_addr();
+	assert!(local.is_ipv6(), "server must be bound on IPv6: {local}");
+
+	// Wait for the client first, bounded: a mismatched bind address family
+	// fails the dial outright, and the acceptor would then wait forever for a
+	// connection that can never arrive.
+	let server_fut = async move { acceptor.accept().await.expect("server conn") };
+	let client_conn = tokio::time::timeout(Duration::from_secs(10), quiche::connect(local, &client_tls, &transport))
+		.await
+		.expect("client connect to an IPv6 peer timed out")
+		.expect("client connect to an IPv6 peer");
+	let server_conn = tokio::time::timeout(Duration::from_secs(10), server_fut)
+		.await
+		.expect("server never saw the IPv6 handshake");
+
+	let (mut c_send, mut c_recv) = client_conn.open_bi().await.expect("open_bi");
+	c_send.write_all(b"ping").await.expect("client write ping");
+	c_send.finish().expect("client finish");
+	let (mut s_send, mut s_recv) = server_conn.accept_bi().await.expect("accept_bi");
+	let mut buf = [0u8; 4];
+	s_recv.read_exact(&mut buf).await.expect("server read ping");
+	assert_eq!(&buf, b"ping");
+	s_send.write_all(b"pong").await.expect("server write pong");
+	s_send.finish().expect("server finish");
+	let mut echo = [0u8; 4];
+	c_recv.read_exact(&mut echo).await.expect("client read pong");
+	assert_eq!(&echo, b"pong");
+
+	client_conn.close(0, b"done");
+	let _ = tokio::time::timeout(Duration::from_secs(2), client_conn.closed()).await;
+}

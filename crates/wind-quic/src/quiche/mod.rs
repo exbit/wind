@@ -11,7 +11,7 @@ pub mod stream;
 pub mod tls;
 
 use std::{
-	net::{Ipv4Addr, SocketAddr},
+	net::{Ipv4Addr, Ipv6Addr, SocketAddr},
 	sync::Arc,
 };
 
@@ -264,6 +264,18 @@ pub async fn connect(
 	connect_with_session(peer, tls_cfg, transport, None).await
 }
 
+/// The local address a client socket binds before dialing `peer`.
+///
+/// The family must match `peer`: a socket bound to `0.0.0.0` cannot dial an
+/// IPv6 peer (and vice versa), so the dial fails before the handshake starts.
+pub fn client_bind_addr(peer: SocketAddr) -> SocketAddr {
+	if peer.is_ipv6() {
+		SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
+	} else {
+		SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+	}
+}
+
 /// Connect to `peer` as a client, optionally resuming a previous TLS session.
 ///
 /// Pass the ticket previously returned by
@@ -277,10 +289,10 @@ pub async fn connect_with_session(
 	transport: &TransportConfig,
 	session: Option<Vec<u8>>,
 ) -> Result<QuicheConnection, QuicError> {
-	let bind_addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0));
+	let bind_addr = client_bind_addr(peer);
 	let udp = UdpSocket::bind(bind_addr)
 		.await
-		.map_err(|e| QuicError::Endpoint(format!("bind client: {e}")))?;
+		.map_err(|e| QuicError::Endpoint(format!("bind client {bind_addr}: {e}")))?;
 	udp.connect(peer)
 		.await
 		.map_err(|e| QuicError::Endpoint(format!("connect socket {peer}: {e}")))?;
