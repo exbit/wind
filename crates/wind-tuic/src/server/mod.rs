@@ -1028,6 +1028,11 @@ async fn get_or_create_session<C: QuicConnection, CB: InboundCallback + Clone>(
 			let (to_outbound_tx, to_outbound_rx) = mpsc::channel::<UdpPacket>(100);
 			let (from_outbound_tx, mut from_outbound_rx) = mpsc::channel::<UdpPacket>(100);
 
+			// The reply transport is not negotiated on the wire: `UdpStream`
+			// keeps the datagram path only while the peer advertises DATAGRAM
+			// support and otherwise falls back to one uni stream per packet, so
+			// a client on stream relay (`udp_relay_mode = "quic"`) still
+			// receives its replies.
 			let tuic_stream = Arc::new(UdpStream::new(conn, assoc_id, reassembled_tx));
 
 			let outbound_stream = CoreUdpStream {

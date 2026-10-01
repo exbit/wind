@@ -836,18 +836,26 @@ mod tests {
 	/// server module; the outbound itself only needs `client` + `quiche`.
 	#[cfg(feature = "server")]
 	mod loopback {
-		use std::{net::Ipv4Addr, sync::Arc};
+		use std::{net::Ipv4Addr, sync::Arc, time::Duration};
 
 		use async_trait::async_trait;
-		use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+		use bytes::Bytes;
+		use tokio::{
+			io::{AsyncReadExt as _, AsyncWriteExt as _},
+			sync::mpsc,
+		};
 		use uuid::Uuid;
 		use wind_core::{
-			AbstractInbound, Dispatcher, FlowContext, Outbound, RouteAction, Router, tcp::AbstractTcpStream, types::TargetAddr,
-			udp::UdpStream as CoreUdpStream,
+			AbstractInbound, Dispatcher, FlowContext, Outbound, RouteAction, Router,
+			hooks::Protocol,
+			rule::NetworkType,
+			tcp::AbstractTcpStream,
+			types::TargetAddr,
+			udp::{UdpPacket, UdpStream as CoreUdpStream},
 		};
 
-		use super::super::{ConnectionOpts, TuicheOutboundBuilder};
-		use crate::quiche::TuicheInboundBuilder;
+		use super::super::{ConnectionOpts, ReconnectConfig, TuicheOutbound, TuicheOutboundBuilder};
+		use crate::quiche::{TuicheInboundBuilder, UdpRelayMode as TransportUdpRelayMode};
 
 		/// Forwards every routed connection by echoing TCP payloads back, so
 		/// the client can verify a full TUIC TCP round trip without a separate
@@ -901,8 +909,13 @@ mod tests {
 
 		/// Start a quiche `TuicheInbound` that echoes, returning its bound
 		/// address and the temp dir holding the certificate (kept alive by the
-		/// caller).
-		async fn start_echo_server(uuid: Uuid, password: &str) -> eyre::Result<(std::net::SocketAddr, tempfile::TempDir)> {
+		/// caller). `server_opts` drives the server transport (notably the UDP
+		/// relay mode / DATAGRAM support).
+		async fn start_echo_server(
+			uuid: Uuid,
+			password: &str,
+			server_opts: ConnectionOpts,
+		) -> eyre::Result<(std::net::SocketAddr, tempfile::TempDir)> {
 			let dir = tempfile::tempdir()?;
 			let generated = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])?;
 			let cert_path = dir.path().join("cert.pem");
@@ -917,6 +930,7 @@ mod tests {
 				.certificate_path(cert_path.to_string_lossy().into_owned())
 				.private_key_path(key_path.to_string_lossy().into_owned())
 				.user(uuid, password.to_string())
+				.connection_opts(server_opts)
 				.build()
 				.await?;
 
@@ -933,9 +947,15 @@ mod tests {
 			Ok((addr, dir))
 		}
 
-		fn client_builder(addr: std::net::SocketAddr, uuid: Uuid, password: &str) -> TuicheOutboundBuilder {
+		fn client_builder(
+			addr: std::net::SocketAddr,
+			uuid: Uuid,
+			password: &str,
+			relay_mode: TransportUdpRelayMode,
+		) -> TuicheOutboundBuilder {
 			let opts = ConnectionOpts {
 				enable_0rtt: false,
+				udp_relay_mode: relay_mode,
 				..Default::default()
 			};
 			TuicheOutboundBuilder::new()
@@ -947,13 +967,67 @@ mod tests {
 				.connection_opts(opts)
 		}
 
+		/// Deterministic failures for the UDP tests: a dropped connection must
+		/// surface as a timeout in the test, not as a reconnect loop.
+		fn no_reconnect() -> ReconnectConfig {
+			ReconnectConfig {
+				enabled: false,
+				..Default::default()
+			}
+		}
+
+		/// Send `payload` through `outbound`'s UDP association and return the
+		/// echoed payload. The echo server mirrors the packet back on the same
+		/// association, so this exercises the reply transport (datagram vs
+		/// unidirectional stream) end to end.
+		async fn udp_roundtrip(outbound: Arc<TuicheOutbound>, payload: &'static [u8]) -> eyre::Result<Bytes> {
+			let target = TargetAddr::IPv4(Ipv4Addr::LOCALHOST, 9);
+			let udp_ctx = FlowContext {
+				target: target.clone(),
+				network: NetworkType::Udp,
+				source: None,
+				inbound_tag: "quiche-loopback-test".into(),
+				protocol: Protocol::Tunnel,
+				user: None,
+				inbound_port: None,
+				inbound_type: None,
+			};
+
+			let (to_outbound_tx, to_outbound_rx) = mpsc::channel::<UdpPacket>(8);
+			let (from_outbound_tx, mut from_outbound_rx) = mpsc::channel::<UdpPacket>(8);
+			let client_stream = CoreUdpStream {
+				tx: from_outbound_tx,
+				rx: to_outbound_rx,
+			};
+			let client = outbound.clone();
+			tokio::spawn(async move {
+				let _ = client.handle_udp(udp_ctx, client_stream).await;
+			});
+
+			to_outbound_tx
+				.send(UdpPacket {
+					source: None,
+					target,
+					payload: Bytes::from_static(payload),
+				})
+				.await?;
+
+			let echoed = tokio::time::timeout(Duration::from_secs(10), from_outbound_rx.recv())
+				.await
+				.map_err(|_| eyre::eyre!("UDP echo timed out — the reply never reached the client"))?
+				.ok_or_else(|| eyre::eyre!("reply channel closed before the echo arrived"))?;
+			Ok(echoed.payload)
+		}
+
 		#[tokio::test]
 		async fn quiche_outbound_tcp_roundtrip() -> eyre::Result<()> {
 			let uuid = Uuid::new_v4();
 			let password = "test-password";
-			let (addr, _dir) = start_echo_server(uuid, password).await?;
+			let (addr, _dir) = start_echo_server(uuid, password, ConnectionOpts::default()).await?;
 
-			let outbound = client_builder(addr, uuid, password).build().await?;
+			let outbound = client_builder(addr, uuid, password, TransportUdpRelayMode::Datagram)
+				.build()
+				.await?;
 			outbound.start_poll().await?;
 
 			let target = TargetAddr::IPv4(Ipv4Addr::LOCALHOST, 80);
@@ -966,6 +1040,85 @@ mod tests {
 				io.read_exact(&mut buf).await?;
 				assert_eq!(buf, probe);
 			}
+
+			outbound.close();
+			Ok(())
+		}
+
+		/// Control: the default (datagram) relay mode still round-trips when
+		/// both transports advertise DATAGRAM support.
+		#[tokio::test]
+		async fn quiche_outbound_udp_datagram_roundtrip() -> eyre::Result<()> {
+			let uuid = Uuid::new_v4();
+			let password = "test-password";
+			let (addr, _dir) = start_echo_server(uuid, password, ConnectionOpts::default()).await?;
+
+			let outbound = Arc::new(
+				client_builder(addr, uuid, password, TransportUdpRelayMode::Datagram)
+					.reconnect(no_reconnect())
+					.build()
+					.await?,
+			);
+			outbound.start_poll().await?;
+
+			let echoed = udp_roundtrip(outbound.clone(), b"udp-datagram-probe").await?;
+			assert_eq!(echoed, &b"udp-datagram-probe"[..]);
+
+			outbound.close();
+			Ok(())
+		}
+
+		/// F18: a client on stream relay (`udp_relay_mode = "quic"`) never
+		/// advertises DATAGRAM support, so the server must answer on
+		/// unidirectional streams. Before the fix the reply took the datagram
+		/// path, quiche rejected it (`InvalidState`) and the client saw no echo
+		/// at all.
+		#[tokio::test]
+		async fn quiche_outbound_udp_stream_relay_roundtrip() -> eyre::Result<()> {
+			let uuid = Uuid::new_v4();
+			let password = "test-password";
+			let (addr, _dir) = start_echo_server(uuid, password, ConnectionOpts::default()).await?;
+
+			let outbound = Arc::new(
+				client_builder(addr, uuid, password, TransportUdpRelayMode::Stream)
+					.reconnect(no_reconnect())
+					.build()
+					.await?,
+			);
+			outbound.start_poll().await?;
+
+			let echoed = udp_roundtrip(outbound.clone(), b"udp-stream-relay-probe").await?;
+			assert_eq!(echoed, &b"udp-stream-relay-probe"[..]);
+
+			outbound.close();
+			Ok(())
+		}
+
+		/// The mirror image: the server transport has DATAGRAM disabled while
+		/// the client is in datagram mode. The client must fall back to
+		/// unidirectional streams for its uplink, otherwise quiche closes the
+		/// connection on receipt of a DATAGRAM frame it did not enable. The
+		/// server still answers with datagrams (the client can receive them).
+		#[tokio::test]
+		async fn quiche_outbound_udp_with_server_stream_transport_roundtrip() -> eyre::Result<()> {
+			let uuid = Uuid::new_v4();
+			let password = "test-password";
+			let server_opts = ConnectionOpts {
+				udp_relay_mode: TransportUdpRelayMode::Stream,
+				..Default::default()
+			};
+			let (addr, _dir) = start_echo_server(uuid, password, server_opts).await?;
+
+			let outbound = Arc::new(
+				client_builder(addr, uuid, password, TransportUdpRelayMode::Datagram)
+					.reconnect(no_reconnect())
+					.build()
+					.await?,
+			);
+			outbound.start_poll().await?;
+
+			let echoed = udp_roundtrip(outbound.clone(), b"udp-server-stream-transport-probe").await?;
+			assert_eq!(echoed, &b"udp-server-stream-transport-probe"[..]);
 
 			outbound.close();
 			Ok(())
