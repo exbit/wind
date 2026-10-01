@@ -5832,6 +5832,8 @@ dependencies = [
  "rcgen 0.14.10",
  "rustls",
  "rustls-acme",
+ "serde",
+ "serde_json",
  "time",
  "tokio",
  "tokio-stream",
