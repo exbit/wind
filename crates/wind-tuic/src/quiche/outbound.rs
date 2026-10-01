@@ -637,11 +637,16 @@ impl Outbound for TuicheOutbound {
 							Some(packet) => packet,
 						};
 
-						let payload_len = packet.payload.len();
-						if let Err(e) = tuic_stream.send_packet(packet).await {
-							warn!(target: "tuic_out", "Failed to send UDP packet to remote (assoc {assoc_id:#06x}): {e}");
-						} else {
-							info!(target: "tuic_out", "Sent UDP packet to remote ({payload_len} bytes, assoc {assoc_id:#06x})");
+						// Send packet to remote via UDP stream. A failure here
+						// means this association's snapshot connection can no
+						// longer reach the peer (replaced by a reconnect, peer
+						// close, or a reset stream), so end the session instead
+						// of warning once per packet and blackholing the rest.
+						if crate::proto::forward_remote_packet(&tuic_stream, packet, assoc_id)
+							.await
+							.is_break()
+						{
+							break;
 						}
 					}
 					_ = gc_interval.tick() => {
