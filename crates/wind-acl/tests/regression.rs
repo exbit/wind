@@ -8,7 +8,7 @@
 
 use std::net::IpAddr;
 
-use wind_acl::{MapField, Match, Ruleset, Side, Verdict, compile};
+use wind_acl::{MapField, Match, NamedSet, Ruleset, SetData, Side, Verdict, compile};
 use wind_core::RouteAction;
 use wind_rule::{MatchContext, NetworkType, Rule};
 
@@ -392,6 +392,133 @@ fn verdict_map_dispatch() {
 	assert_eq!(route_port(&rs, 22), Decision::Forward("after-map".into()));
 }
 
+/// W19: the typed `Ip` leaf must judge an IPv4-mapped IPv6 address
+/// (`::ffff:a.b.c.d`) by the IPv4 CIDR it embeds, or a dual-stack peer bypasses
+/// an `IP-CIDR,...,REJECT` rule merely by using the mapped spelling.
+#[test]
+fn typed_ip_leaf_matches_ipv4_mapped_ipv6() {
+	let rs = Ruleset {
+		sets: vec![],
+		maps: vec![],
+		entry: 0,
+		chains: vec![wind_acl::Chain {
+			name: "main".into(),
+			policy: Verdict::Forward("policy".into()),
+			rules: vec![
+				rule(
+					Match::Ip {
+						side: Side::Dst,
+						net: "10.0.0.0/8".parse().unwrap(),
+					},
+					Verdict::Forward("v4-cidr".into()),
+				),
+				rule(Match::Always, Verdict::Forward("fallback".into())),
+			],
+		}],
+	};
+
+	assert_eq!(route_dst_ip(&rs, "10.0.0.1"), Decision::Forward("v4-cidr".into()));
+	assert_eq!(route_dst_ip(&rs, "::ffff:10.0.0.1"), Decision::Forward("v4-cidr".into()));
+	assert_eq!(
+		route_dst_ip(&rs, "::ffff:10.255.255.255"),
+		Decision::Forward("v4-cidr".into())
+	);
+	// The widening is limited to the embedded IPv4 range: an unrelated mapped
+	// address and a genuine IPv6 address still fall through.
+	assert_eq!(route_dst_ip(&rs, "::ffff:11.0.0.1"), Decision::Forward("fallback".into()));
+	assert_eq!(route_dst_ip(&rs, "2001:db8::1"), Decision::Forward("fallback".into()));
+}
+
+/// W19: `SetData::Ips` membership (the optimizer's form) folds the mapped
+/// spelling too, and a literal IPv6 CIDR that already contained the mapped
+/// address keeps matching — the change only ever widens.
+#[test]
+fn ip_set_membership_and_v6_leaf_keep_the_mapped_address_working() {
+	let rs = Ruleset {
+		sets: vec![NamedSet {
+			data: SetData::Ips(vec!["192.168.0.0/16".parse().unwrap()]),
+		}],
+		maps: vec![],
+		entry: 0,
+		chains: vec![wind_acl::Chain {
+			name: "main".into(),
+			policy: Verdict::Forward("policy".into()),
+			rules: vec![
+				rule(Match::InSet { side: Side::Src, set: 0 }, Verdict::Forward("v4-set".into())),
+				rule(
+					Match::Ip {
+						side: Side::Dst,
+						net: "::ffff:0:0/96".parse().unwrap(),
+					},
+					Verdict::Forward("mapped-cidr".into()),
+				),
+				rule(Match::Always, Verdict::Forward("fallback".into())),
+			],
+		}],
+	};
+
+	assert_eq!(route_src_ip(&rs, "::ffff:192.168.1.1"), Decision::Forward("v4-set".into()));
+	assert_eq!(route_dst_ip(&rs, "::ffff:10.0.0.1"), Decision::Forward("mapped-cidr".into()));
+	// A mapped address outside both CIDRs is still not matched.
+	assert_eq!(route_src_ip(&rs, "::ffff:10.0.0.1"), Decision::Forward("fallback".into()));
+}
+
+/// W19 differential: the legacy reference, the degenerate embedding (typed `Ip`
+/// leaf) and the optimizer output (IP set buckets) must agree for mapped
+/// addresses as well; the explicit assertions pin the pre-fix behaviour where
+/// the mapped private address reached the default outbound instead of `REJECT`.
+#[test]
+fn mapped_v4_ip_rules_agree_across_legacy_embedding_and_optimizer() {
+	let config = "
+IP-CIDR,10.0.0.0/8,reject
+IP-CIDR,172.16.0.0/12,reject
+IP-CIDR,192.168.0.0/16,direct
+MATCH,proxy
+";
+	let reference_rules = parse(config);
+	let embedded = Ruleset::from_rules(parse(config), DEFAULT_OUTBOUND);
+	let optimized = compile(Ruleset::from_rules(parse(config), DEFAULT_OUTBOUND));
+
+	// The two same-verdict reject rules are folded into one `Ips` set, so the
+	// grid below covers `SetData::Ips` as well as the typed `Ip` leaf.
+	assert!(
+		optimized.sets.iter().any(|s| matches!(s.data, SetData::Ips(_))),
+		"expected the same-verdict IP run to be folded into an Ips set"
+	);
+
+	for dst_ip in [
+		"10.0.0.1",
+		"::ffff:10.0.0.1",
+		"::ffff:10.255.255.255",
+		"172.16.5.5",
+		"::ffff:172.16.5.5",
+		"192.168.1.1",
+		"::ffff:192.168.1.1",
+		"11.0.0.1",
+		"::ffff:11.0.0.1",
+		"2001:db8::1",
+	] {
+		let ctx = MatchContext {
+			dst_ip: Some(dst_ip.parse().unwrap()),
+			..Default::default()
+		};
+		let want = reference(&reference_rules, &ctx);
+		assert_eq!(want, norm_action(&embedded.route(&ctx)), "embedded mismatch for {dst_ip}");
+		assert_eq!(want, norm_action(&optimized.route(&ctx)), "optimized mismatch for {dst_ip}");
+	}
+
+	assert_eq!(
+		route_dst_ip(&embedded, "::ffff:10.0.0.1"),
+		Decision::Reject,
+		"a mapped 10/8 destination must hit the REJECT rule"
+	);
+	assert_eq!(
+		route_dst_ip(&embedded, "::ffff:192.168.1.1"),
+		Decision::Forward("direct".into()),
+		"a mapped 192.168/16 destination must hit the direct rule"
+	);
+}
+
 // -- small helpers for the hand-built chain tests --
 
 fn rule(matches: Match, verdict: Verdict) -> wind_acl::IrRule {
@@ -438,6 +565,22 @@ fn route_for(rs: &Ruleset, net: NetworkType, port: u16) -> Decision {
 fn route_port(rs: &Ruleset, port: u16) -> Decision {
 	let ctx = MatchContext {
 		dst_port: Some(port),
+		..Default::default()
+	};
+	norm_action(&rs.route(&ctx))
+}
+
+fn route_dst_ip(rs: &Ruleset, ip: &str) -> Decision {
+	let ctx = MatchContext {
+		dst_ip: Some(ip.parse().unwrap()),
+		..Default::default()
+	};
+	norm_action(&rs.route(&ctx))
+}
+
+fn route_src_ip(rs: &Ruleset, ip: &str) -> Decision {
+	let ctx = MatchContext {
+		src_ip: Some(ip.parse().unwrap()),
 		..Default::default()
 	};
 	norm_action(&rs.route(&ctx))

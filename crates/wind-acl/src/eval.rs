@@ -7,11 +7,16 @@
 //! the entry chain reaches the entry `policy`, and one inside a jumped-to chain
 //! resumes the caller at the rule after the jump); a base chain that falls
 //! through applies its `policy`.
+//!
+//! IP leaves compare the connection address with
+//! [`wind_rule::net_contains_ip`], so an IPv4-mapped IPv6 destination
+//! (`::ffff:10.0.0.1`) is judged by the IPv4 CIDR it embeds — exactly as the
+//! legacy `Rule::matches` reference does for [`Match::Predicate`].
 
 use std::net::IpAddr;
 
 use wind_core::RouteAction;
-use wind_rule::MatchContext;
+use wind_rule::{MatchContext, net_contains_ip};
 
 use crate::model::{DomainSet, MapField, Match, Ruleset, SetData, Side, Verdict};
 
@@ -134,7 +139,10 @@ impl Ruleset {
 			Match::Not(inner) => !self.match_expr(inner, ctx),
 			Match::Always => true,
 
-			Match::Ip { side, net } => side_ip(ctx, *side).is_some_and(|ip| net.contains(&ip)),
+			// `net_contains_ip` (not a bare `IpNet::contains`) so a mapped-v4
+			// destination is judged by the IPv4 CIDR it embeds, exactly as
+			// `Rule::matches` does for the `Predicate` escape hatch.
+			Match::Ip { side, net } => side_ip(ctx, *side).is_some_and(|ip| net_contains_ip(net, ip)),
 			Match::Port { side, range } => side_port(ctx, *side).is_some_and(|p| range.contains(&p)),
 			Match::Proto(n) => ctx.network.is_some_and(|nn| nn == *n),
 			Match::Domain(test) => ctx.domain.is_some_and(|d| domain_test_matches(test, d)),
@@ -148,7 +156,7 @@ impl Ruleset {
 	fn set_contains(&self, set: usize, side: Side, ctx: &MatchContext) -> bool {
 		match &self.sets[set].data {
 			SetData::Domains(ds) => ctx.domain.is_some_and(|d| domain_set_contains(ds, d)),
-			SetData::Ips(nets) => side_ip(ctx, side).is_some_and(|ip| nets.iter().any(|n| n.contains(&ip))),
+			SetData::Ips(nets) => side_ip(ctx, side).is_some_and(|ip| nets.iter().any(|n| net_contains_ip(n, ip))),
 			SetData::Ports(ranges) => side_port(ctx, side).is_some_and(|p| ranges.iter().any(|r| r.contains(&p))),
 		}
 	}
