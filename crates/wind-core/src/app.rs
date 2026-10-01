@@ -193,7 +193,7 @@ impl<R: Router> App<R> {
 			sample_interval: flush_interval,
 		};
 
-		let mut dispatcher = Dispatcher::new(router);
+		let mut dispatcher = Dispatcher::new(router).context(ctx.clone());
 		for (name, handler) in &outbounds {
 			dispatcher.add_handler(name.clone(), handler.clone());
 		}
