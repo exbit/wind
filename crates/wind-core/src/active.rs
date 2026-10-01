@@ -73,6 +73,16 @@ impl ActiveConnections {
 
 	/// Cancel every live connection belonging to `user`. Returns how many were
 	/// kicked.
+	///
+	/// Deliberately *keeps* the entries registered: the kicked connections own
+	/// their registry rows until they finish unwinding and call `deregister`,
+	/// so `count_for` keeps counting them meanwhile. That is the fail-closed
+	/// direction for a per-user limit — a kick must not open budget for a
+	/// replacement connection while the kicked one can still be relaying
+	/// traffic. Removing the rows here would instead make the limit
+	/// momentarily permissive. A connection that never deregisters (for
+	/// example a handler that panicked before its cleanup) therefore keeps
+	/// counting until the process restarts; recovery is the caller's job.
 	pub fn kick_user(&self, user: &UserId) -> usize {
 		let mut kicked = 0;
 		for entry in self.inner.iter() {
@@ -171,5 +181,47 @@ mod tests {
 		assert_eq!(active.len(), 0);
 		assert!(active.is_empty());
 		assert!(active.per_user.is_empty());
+	}
+
+	/// Pins the deliberate half of `kick_user`'s contract: cancelling the token
+	/// does not hand the user's registered rows (or its tally) back early, so a
+	/// cancelled-but-still-unwinding connection cannot be replaced under a
+	/// per-user limit. The rows disappear only when the connection itself
+	/// deregisters.
+	#[test]
+	fn a_kicked_connection_keeps_counting_until_it_deregisters() {
+		let active = ActiveConnections::new();
+		let user = UserId::from("u1");
+		let token = CancellationToken::new();
+		active.register(7, user.clone(), token.clone());
+
+		assert_eq!(active.kick_user(&user), 1);
+		assert!(token.is_cancelled());
+		// The registry row survives the kick, and the tally still mirrors it.
+		assert!(active.inner.contains_key(&7));
+		assert_eq!(active.len(), 1);
+		assert_eq!(active.count_for(&user), 1);
+		assert_eq!(scanned_count(&active, &user), 1);
+		// A repeated kick finds the same row and changes nothing else.
+		assert_eq!(active.kick_user(&user), 1);
+		assert_eq!(active.count_for(&user), 1);
+
+		// The kick does not disturb other users.
+		let other = UserId::from("u2");
+		let other_token = CancellationToken::new();
+		active.register(8, other.clone(), other_token.clone());
+		assert_eq!(active.kick_user(&user), 1);
+		assert!(!other_token.is_cancelled());
+		assert_eq!(active.count_for(&other), 1);
+
+		// Only the connection's own deregistration frees the budget again.
+		active.deregister(7);
+		assert_eq!(active.count_for(&user), 0);
+		assert!(!active.inner.contains_key(&7));
+		assert!(!active.per_user.contains_key(&user), "leaked a tally entry for {user}");
+		// A late second deregistration for the same id stays harmless.
+		active.deregister(7);
+		assert_eq!(active.count_for(&other), 1);
+		assert_eq!(active.len(), 1);
 	}
 }
