@@ -717,6 +717,11 @@ async fn handle_uni_stream<C: QuicConnection, CB: InboundCallback + Clone>(
 						.await
 						.map_err(|e| eyre::eyre!("Failed to read packet command: {}", e))?;
 					let cmd = crate::proto::decode_command(CmdType::Packet, &mut &cmd_body[..], "uni stream")?;
+					// `parse_command_body(Packet, ..)` yields only
+					// `Command::Packet { .. }`, so this arm cannot be taken
+					// today. It is an error return rather than a panic because
+					// the bytes come from the peer: a decoder disagreement must
+					// fail the media task, never abort it.
 					let Command::Packet {
 						assoc_id,
 						pkt_id,
@@ -725,7 +730,7 @@ async fn handle_uni_stream<C: QuicConnection, CB: InboundCallback + Clone>(
 						size,
 					} = cmd
 					else {
-						unreachable!("decode_command(Packet, ..) must return Command::Packet");
+						return Err(eyre::eyre!("Packet command body decoded into a different command variant"));
 					};
 
 					// Read address (capped at ~258 bytes).
@@ -933,7 +938,7 @@ async fn handle_auth<C: QuicConnection>(connection: &InboundCtx<C>, uuid: Uuid, 
 			.map(|pw| (UserId::from(uuid), Arc::from(pw.as_bytes()))),
 	};
 	let (user, password_bytes, user_known): (Option<UserId>, Arc<[u8]>, bool) = match looked_up {
-		Some((u, pw)) => (Some(u), pw, true),
+		Some((user, password)) => (Some(user), password, true),
 		None => (None, Arc::from(DUMMY_PASSWORD), false),
 	};
 
@@ -969,7 +974,18 @@ async fn handle_auth<C: QuicConnection>(connection: &InboundCtx<C>, uuid: Uuid, 
 		connection.close_auth_failed(b"auth failed");
 		return Err(eyre::eyre!("Invalid authentication"));
 	}
-	let user = user.expect("user_known implies Some(user)");
+
+	// An identity must exist whenever `user_known` is true: the two come from
+	// the same lookup match. That makes this guard unreachable today, but it is
+	// an error return rather than an `expect` because this is the
+	// `Authenticate` path inside the connection driver — a panic here would
+	// abort the connection task instead of terminating the connection the way
+	// the spec requires. The `let ... else` also keeps the rest of the function
+	// on a plain `UserId` instead of an `Option<UserId>` plus a panic.
+	let Some(user) = user else {
+		connection.close_auth_failed(b"auth failed");
+		return Err(eyre::eyre!("Invalid authentication"));
+	};
 
 	// Connection-management veto now that the identity is known (e.g. a
 	// per-user concurrent-connection limit). A rejected connection is closed
@@ -1834,6 +1850,107 @@ mod tests {
 		assert_eq!(read_prefix(&mut empty).await, None);
 	}
 
+	/// [`UdpPacket`] sink that records what the uni-stream packet path handed
+	/// to the callback's outbound stream.
+	#[derive(Clone)]
+	struct RecordingUdpCallback {
+		tx: tokio::sync::mpsc::UnboundedSender<UdpPacket>,
+	}
+
+	impl InboundCallback for RecordingUdpCallback {
+		#[allow(clippy::manual_async_fn)]
+		fn handle_tcpstream(
+			&self,
+			_ctx: FlowContext,
+			_stream: impl wind_core::tcp::AbstractTcpStream + 'static,
+		) -> impl std::future::Future<Output = eyre::Result<()>> + Send {
+			async { Ok(()) }
+		}
+
+		fn handle_udpstream(
+			&self,
+			_ctx: FlowContext,
+			mut udp_stream: CoreUdpStream,
+		) -> impl std::future::Future<Output = eyre::Result<()>> + Send {
+			let tx = self.tx.clone();
+			async move {
+				loop {
+					let Some(packet) = udp_stream.rx.recv().await else {
+						break;
+					};
+					if tx.send(packet).is_err() {
+						break;
+					}
+				}
+				Ok(())
+			}
+		}
+	}
+
+	/// W41: the uni-stream `Packet` path must forward the datagram it decoded
+	/// instead of panicking. `decode_command(Packet, ..)` only ever yields
+	/// `Command::Packet`, so the removed `unreachable!` was not reachable
+	/// through this entry point and this test cannot distinguish the two: it
+	/// drives the real `handle_uni_stream` with the exact wire bytes a client
+	/// sends and pins the contract the guard now reports as an error — the
+	/// command must still decode into a `Packet` and reach the callback.
+	#[tokio::test]
+	async fn uni_stream_packet_command_forwards_the_datagram_instead_of_panicking() {
+		let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<UdpPacket>();
+		let cb = RecordingUdpCallback { tx };
+
+		// Pre-authenticated context: the packet path requires it, and the fix
+		// must not disturb the forwarding itself.
+		let ctx = unauthenticated_test_ctx(
+			DummyConn::default(),
+			Arc::new(CountingAuth {
+				known: None,
+				password: Arc::from(&b"pw"[..]),
+				lookups: AtomicUsize::new(0),
+			}),
+		);
+		ctx.auth.store(Some(Arc::new(AuthState {
+			user: UserId::from("test-user"),
+		})));
+		let ctx = Arc::new(ctx);
+
+		let payload = b"uni-stream-datagram";
+		let mut bytes = vec![crate::proto::VER, u8::from(CmdType::Packet)];
+		bytes.extend_from_slice(&7u16.to_be_bytes()); // assoc_id
+		bytes.extend_from_slice(&1u16.to_be_bytes()); // pkt_id
+		bytes.push(1); // frag_total == 1: a complete datagram
+		bytes.push(0); // frag_id
+		bytes.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+		bytes.push(0x01); // AddressType::IPv4
+		bytes.extend_from_slice(&[127, 0, 0, 1]);
+		bytes.extend_from_slice(&8080u16.to_be_bytes());
+		bytes.extend_from_slice(payload);
+
+		let (mut writer, recv) = tokio::io::duplex(4096);
+		tokio::io::AsyncWriteExt::write_all(&mut writer, &bytes)
+			.await
+			.expect("the duplex fixture must accept the frame");
+		drop(writer);
+
+		handle_uni_stream(ctx.clone(), recv, cb)
+			.await
+			.expect("a well-formed Packet command must be forwarded, not panic");
+
+		let forwarded = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+			.await
+			.expect("the datagram must reach the callback's outbound stream")
+			.expect("the recording callback must stay alive");
+		assert_eq!(forwarded.payload.as_ref(), payload.as_slice());
+		assert_eq!(
+			forwarded.target,
+			wind_core::types::TargetAddr::IPv4(Ipv4Addr::new(127, 0, 0, 1), 8080)
+		);
+
+		ctx.udp_root_cancel.cancel();
+		ctx.udp_sessions.invalidate_all();
+		ctx.udp_sessions.run_pending_tasks().await;
+	}
+
 	/// Counting [`TuicAuthenticator`] that records the credential lookups the
 	/// server performs and whether the UUID was known.
 	struct CountingAuth {
@@ -1855,7 +1972,13 @@ mod tests {
 	/// An unauthenticated connection context over `conn`, wired to `auth`, with
 	/// a pristine auth state and attempt budget.
 	fn auth_test_ctx(conn: DummyConn, auth: Arc<dyn TuicAuthenticator>) -> Arc<InboundCtx<DummyConn>> {
-		Arc::new(InboundCtx {
+		Arc::new(unauthenticated_test_ctx(conn, auth))
+	}
+
+	/// The same context as [`auth_test_ctx`], but unwrapped so a test can seed
+	/// the auth state before sharing it.
+	fn unauthenticated_test_ctx(conn: DummyConn, auth: Arc<dyn TuicAuthenticator>) -> InboundCtx<DummyConn> {
+		InboundCtx {
 			conn,
 			conn_span: tracing::Span::none(),
 			auth: ArcSwapOption::empty(),
@@ -1877,7 +2000,7 @@ mod tests {
 			inbound_tag: Arc::from("test-tuic"),
 			active: None,
 			conn_cancel: CancellationToken::new(),
-		})
+		}
 	}
 
 	/// F20: a failed `Auth` must terminate the connection (SPEC §5.1.3, §7.5,
