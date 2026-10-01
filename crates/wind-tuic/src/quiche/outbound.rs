@@ -1013,6 +1013,7 @@ mod tests {
 			types::TargetAddr,
 			udp::{UdpPacket, UdpStream as CoreUdpStream},
 		};
+		use wind_quic::QuicConnection as _;
 
 		use super::super::{ConnectionOpts, ReconnectConfig, TuicheOutbound, TuicheOutboundBuilder};
 		use crate::quiche::{TuicheInboundBuilder, UdpRelayMode as TransportUdpRelayMode};
@@ -1076,6 +1077,17 @@ mod tests {
 			password: &str,
 			server_opts: ConnectionOpts,
 		) -> eyre::Result<(std::net::SocketAddr, tempfile::TempDir)> {
+			start_echo_server_with_auth_timeout(uuid, password, server_opts, None).await
+		}
+
+		/// Same as [`start_echo_server`], but able to override the inbound's
+		/// authentication window; `None` keeps the builder's default.
+		async fn start_echo_server_with_auth_timeout(
+			uuid: Uuid,
+			password: &str,
+			server_opts: ConnectionOpts,
+			auth_timeout: Option<Duration>,
+		) -> eyre::Result<(std::net::SocketAddr, tempfile::TempDir)> {
 			let dir = tempfile::tempdir()?;
 			let generated = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])?;
 			let cert_path = dir.path().join("cert.pem");
@@ -1084,15 +1096,17 @@ mod tests {
 			std::fs::write(&key_path, generated.signing_key.serialize_pem())?;
 
 			let (addr_tx, mut addr_rx) = tokio::sync::watch::channel(None::<std::net::SocketAddr>);
-			let inbound = TuicheInboundBuilder::new()
+			let mut builder = TuicheInboundBuilder::new()
 				.listen_addr("127.0.0.1:0".parse()?)
 				.bound_addr(addr_tx)
 				.certificate_path(cert_path.to_string_lossy().into_owned())
 				.private_key_path(key_path.to_string_lossy().into_owned())
 				.user(uuid, password.to_string())
-				.connection_opts(server_opts)
-				.build()
-				.await?;
+				.connection_opts(server_opts);
+			if let Some(auth_timeout) = auth_timeout {
+				builder = builder.auth_timeout(auth_timeout);
+			}
+			let inbound = builder.build().await?;
 
 			let mut dispatcher = Dispatcher::new(ForwardRouter);
 			dispatcher.add_handler("default", Arc::new(EchoOutbound) as Arc<dyn Outbound>);
@@ -1264,6 +1278,44 @@ mod tests {
 					"expected the handshake to time out with no common ALPN, got: {err}"
 				),
 			}
+			Ok(())
+		}
+
+		/// W46: the inbound's authentication window is configurable and really
+		/// applied. A raw QUIC client completes the handshake but never sends
+		/// `Authenticate`, so the server's auth-timeout guard is the only thing
+		/// that can close the connection. With the former private 3 s constant
+		/// it survived the full 3 s; configured to 250 ms it must be gone well
+		/// before that — the 2 s bound below sits under the old default on
+		/// purpose, so this test fails if the window is ignored.
+		#[tokio::test]
+		async fn quiche_server_closes_an_unauthenticated_connection_at_the_configured_auth_timeout() -> eyre::Result<()> {
+			let configured = Duration::from_millis(250);
+			let (addr, _dir) = start_echo_server_with_auth_timeout(
+				Uuid::new_v4(),
+				"test-password",
+				ConnectionOpts::default(),
+				Some(configured),
+			)
+			.await?;
+
+			let tls = wind_quic::ClientTlsConfig {
+				server_name: "localhost".to_string(),
+				verify_certificate: false,
+				alpn: vec![b"h3".to_vec()],
+				enable_early_data: false,
+			};
+			let started = std::time::Instant::now();
+			let conn = wind_quic::quiche::connect(addr, &tls, &ConnectionOpts::default().to_transport()).await?;
+
+			tokio::time::timeout(Duration::from_secs(2), conn.closed())
+				.await
+				.map_err(|_| eyre::eyre!("an unauthenticated connection outlived its configured {configured:?} auth window"))?;
+			let elapsed = started.elapsed();
+			assert!(
+				elapsed < Duration::from_secs(2),
+				"the server kept an unauthenticated connection for {elapsed:?}, past the configured {configured:?} window"
+			);
 			Ok(())
 		}
 
