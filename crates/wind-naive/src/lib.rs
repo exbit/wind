@@ -281,6 +281,13 @@ const UOT_IO_THREAD_NAME: &str = "wind-naive-uot-io";
 /// Name of the plain thread that joins an I/O thread outside a tokio runtime.
 const REAPER_THREAD_NAME: &str = "wind-naive-reaper";
 
+/// Largest chunk a naive bridge relays in one read.
+///
+/// It is also the size of the **single** read buffer each relay owns (see
+/// [`relay_local_and_naive`] and the TCP bridge's I/O thread) — never one
+/// buffer per chunk.
+const NAIVE_BRIDGE_CHUNK: usize = 65535;
+
 /// Spawn a bridge I/O thread with an injectable strategy.
 ///
 /// The bridges run in `Result`-returning functions, so a refused thread —
@@ -505,6 +512,54 @@ async fn naive_uot_bridge(
 	Ok(())
 }
 
+/// Relay a bridge's local stream and its blocking I/O thread until either side
+/// ends.
+///
+/// Owns the relay's **single** read buffer: `read` fills it from the start and
+/// reports the filled prefix, so the next read reuses it as is — no fresh
+/// allocation and no re-zeroing. The previous code assigned
+/// `local_buf = vec![0u8; NAIVE_BRIDGE_CHUNK]` after every successful read,
+/// which allocated *and* zeroed 64 KiB per chunk (the old buffer is still alive
+/// while the new one is allocated, so the allocator cannot hand back the same
+/// block).
+///
+/// Split out of [`naive_async_bridge`] so the buffer's lifetime — one per
+/// relay, not one per chunk — can be asserted without a Cronet engine.
+async fn relay_local_and_naive(
+	stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
+	naive_write_tx: &mpsc::Sender<Vec<u8>>,
+	naive_read_rx: &mut mpsc::Receiver<Vec<u8>>,
+) {
+	let mut local_buf = vec![0u8; NAIVE_BRIDGE_CHUNK];
+
+	loop {
+		tokio::select! {
+			result = stream.read(&mut local_buf) => {
+				match result {
+					Ok(0) => break,
+					Ok(n) => {
+						if naive_write_tx.send(local_buf[..n].to_vec()).await.is_err() {
+							break;
+						}
+					}
+					Err(e) => {
+						tracing::debug!(error = %e, "local stream read error");
+						break;
+					}
+				}
+			}
+			Some(data) = naive_read_rx.recv() => {
+				if let Err(e) = stream.write_all(&data).await {
+					tracing::debug!(error = %e, "local stream write error");
+					break;
+				}
+				let _ = stream.flush().await;
+			}
+			else => break,
+		}
+	}
+}
+
 /// Bridge data between a blocking Cronet connection
 /// ([`cronet_rs::naive_conn::NaiveConn`]) and a tokio [`AsyncRead`] +
 /// [`AsyncWrite`] stream.
@@ -539,7 +594,7 @@ where
 		let (naive_read_tx, mut naive_read_rx) = mpsc::channel::<Vec<u8>>(NAIVE_BRIDGE_QUEUE);
 
 		let io_handle = spawn_io_thread(BRIDGE_IO_THREAD_NAME, move || {
-			let mut read_buf = [0u8; 65535];
+			let mut read_buf = [0u8; NAIVE_BRIDGE_CHUNK];
 
 			loop {
 				loop {
@@ -579,35 +634,9 @@ where
 		})
 		.context("spawn wind-naive-io thread")?;
 
-		let mut local_buf = vec![0u8; 65535];
-
-		loop {
-			tokio::select! {
-				result = stream.read(&mut local_buf) => {
-					match result {
-						Ok(0) => break,
-						Ok(n) => {
-							if naive_write_tx.send(local_buf[..n].to_vec()).await.is_err() {
-								break;
-							}
-							local_buf = vec![0u8; 65535];
-						}
-						Err(e) => {
-							tracing::debug!(error = %e, "local stream read error");
-							break;
-						}
-					}
-				}
-				Some(data) = naive_read_rx.recv() => {
-					if let Err(e) = stream.write_all(&data).await {
-						tracing::debug!(error = %e, "local stream write error");
-						break;
-					}
-					let _ = stream.flush().await;
-				}
-				else => break,
-			}
-		}
+		// One reusable read buffer lives inside the relay (see
+		// [`relay_local_and_naive`]); nothing here allocates per chunk.
+		relay_local_and_naive(&mut stream, &naive_write_tx, &mut naive_read_rx).await;
 
 		// `join` must not run inline here: the I/O thread may be parked in a
 		// blocking `naive.read()`, and joining it from an async worker would
@@ -874,6 +903,106 @@ mod tests {
 			before + 1,
 			"the bridge must join its io thread instead of detaching the handle"
 		);
+	}
+
+	/// A local-stream double that records the **address** of the buffer every
+	/// read is handed, then replays `chunks` and reports EOF.
+	///
+	/// An entry in a `ReadBuf` is the slice the caller passed to `read`, so
+	/// with nothing filled yet `filled().as_ptr()` is the address of that
+	/// buffer: two reads that observe the same address were handed the same
+	/// buffer.
+	struct ReadBufAddressProbe {
+		chunks: std::collections::VecDeque<Vec<u8>>,
+		bases: Arc<std::sync::Mutex<Vec<usize>>>,
+	}
+
+	impl tokio::io::AsyncRead for ReadBufAddressProbe {
+		fn poll_read(
+			self: std::pin::Pin<&mut Self>,
+			_cx: &mut std::task::Context<'_>,
+			buf: &mut tokio::io::ReadBuf<'_>,
+		) -> std::task::Poll<std::io::Result<()>> {
+			let this = self.get_mut();
+			this.bases.lock().unwrap().push(buf.filled().as_ptr() as usize);
+			if let Some(chunk) = this.chunks.pop_front() {
+				buf.put_slice(&chunk);
+			}
+			// An unfilled `ReadBuf` is how a reader reports EOF.
+			std::task::Poll::Ready(Ok(()))
+		}
+	}
+
+	impl tokio::io::AsyncWrite for ReadBufAddressProbe {
+		fn poll_write(
+			self: std::pin::Pin<&mut Self>,
+			_cx: &mut std::task::Context<'_>,
+			buf: &[u8],
+		) -> std::task::Poll<std::io::Result<usize>> {
+			std::task::Poll::Ready(Ok(buf.len()))
+		}
+
+		fn poll_flush(
+			self: std::pin::Pin<&mut Self>,
+			_cx: &mut std::task::Context<'_>,
+		) -> std::task::Poll<std::io::Result<()>> {
+			std::task::Poll::Ready(Ok(()))
+		}
+
+		fn poll_shutdown(
+			self: std::pin::Pin<&mut Self>,
+			_cx: &mut std::task::Context<'_>,
+		) -> std::task::Poll<std::io::Result<()>> {
+			std::task::Poll::Ready(Ok(()))
+		}
+	}
+
+	/// One read buffer must serve the whole relay, not one per chunk.
+	///
+	/// The previous loop body re-created the buffer after every successful read
+	/// (`local_buf = vec![0u8; 65535]`), allocating *and* zeroing 64 KiB per
+	/// chunk. That new allocation is taken while the buffer it replaces is
+	/// still alive, so consecutive reads cannot observe the same address — the
+	/// same probe passes only when the relay keeps one buffer.
+	///
+	/// This drives the real relay loop ([`relay_local_and_naive`]) with a
+	/// stream double; no Cronet engine, I/O thread, or runtime thread is
+	/// involved, so nothing else in this test binary can perturb the
+	/// observation.
+	#[tokio::test]
+	async fn relay_reuses_one_read_buffer_instead_of_reallocating_per_chunk() {
+		const CHUNKS: usize = 8;
+
+		let bases = Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+		let chunks: std::collections::VecDeque<Vec<u8>> = (0..CHUNKS).map(|i| vec![i as u8 + 1; 64]).collect();
+		let mut stream = ReadBufAddressProbe {
+			chunks,
+			bases: Arc::clone(&bases),
+		};
+
+		let (write_tx, mut write_rx) = mpsc::channel::<Vec<u8>>(64);
+		// Held (and silent) so the downlink branch never becomes ready.
+		let (_read_tx, mut read_rx) = mpsc::channel::<Vec<u8>>(64);
+
+		relay_local_and_naive(&mut stream, &write_tx, &mut read_rx).await;
+
+		let observed = bases.lock().unwrap().clone();
+		assert_eq!(
+			observed.len(),
+			CHUNKS + 1,
+			"every chunk and the EOF read must have been handed a buffer"
+		);
+		assert!(
+			observed.iter().all(|base| *base == observed[0]),
+			"one buffer must serve the whole relay, but the reads saw distinct buffers: {observed:?}"
+		);
+
+		// The chunks must still arrive whole and in order.
+		let received: Vec<Vec<u8>> = std::iter::from_fn(|| write_rx.try_recv().ok()).collect();
+		assert_eq!(received.len(), CHUNKS);
+		for (i, chunk) in received.iter().enumerate() {
+			assert_eq!(chunk, &vec![i as u8 + 1; 64], "chunk {i} must arrive unchanged");
+		}
 	}
 
 	/// A refused bridge I/O thread must be reported through the caller's
