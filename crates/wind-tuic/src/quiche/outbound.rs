@@ -66,8 +66,11 @@ pub struct ReconnectConfig {
 	/// exponential backoff until it succeeds or the client shuts down.
 	pub enabled: bool,
 	/// Delay before the first reconnect attempt; doubled after each failure.
+	/// Must be positive: a zero delay never grows and would turn the reconnect
+	/// supervisor into a busy loop.
 	pub initial_backoff: Duration,
-	/// Upper bound on the backoff delay.
+	/// Upper bound on the backoff delay. Must be positive, otherwise every
+	/// delay is clamped to zero.
 	pub max_backoff: Duration,
 }
 
@@ -147,6 +150,9 @@ impl TuicheOutbound {
 		if opts.gc_lifetime.is_zero() {
 			return Err(eyre::eyre!("TUIC GC lifetime must be positive"));
 		}
+		// Reject a zero backoff before dialing: the supervisor would otherwise
+		// re-dial in a hot loop instead of waiting between attempts.
+		validate_reconnect(&opts.reconnect)?;
 
 		let token = ctx.token.child_token();
 		let session: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
@@ -341,9 +347,31 @@ fn spawn_ticket_capture(
 	);
 }
 
-/// Next exponential-backoff delay: double `current`, capped at `max`.
+/// Next exponential-backoff delay: doubling never grows a zero delay, so a
+/// zero `current` is returned unchanged. [`validate_reconnect`] rejects a zero
+/// `initial_backoff` up front, which is what keeps the loop from hot-spinning.
 fn next_backoff(current: Duration, max: Duration) -> Duration {
 	current.saturating_mul(2).min(max)
+}
+
+/// Reject a [`ReconnectConfig`] whose backoff could never grow.
+///
+/// Mirrors the quinn outbound's guard: [`next_backoff`] doubles the current
+/// delay, so a zero `initial_backoff` (or a zero `max_backoff`, which clamps
+/// every delay) makes [`reconnect_loop`] re-dial without waiting. The default
+/// config (500 ms → 30 s) is unaffected.
+///
+/// Checked regardless of `enabled`: a zero delay is invalid configuration
+/// either way, and failing at construction is cheaper to diagnose than a busy
+/// loop after the first drop.
+fn validate_reconnect(reconnect: &ReconnectConfig) -> Result<(), Error> {
+	if reconnect.initial_backoff.is_zero() {
+		return Err(eyre::eyre!("TUIC reconnect initial backoff must be positive"));
+	}
+	if reconnect.max_backoff.is_zero() {
+		return Err(eyre::eyre!("TUIC reconnect max backoff must be positive"));
+	}
+	Ok(())
 }
 
 /// Retry [`establish`] with exponential backoff until it succeeds or
@@ -831,6 +859,85 @@ mod tests {
 		let cfg = ReconnectConfig::default();
 		assert!(cfg.enabled);
 		assert!(cfg.initial_backoff <= cfg.max_backoff);
+	}
+
+	/// A zero `initial_backoff` is the hot-spin input: `next_backoff` returns
+	/// zero for every failure, so the supervisor re-dials without ever
+	/// sleeping. It must be rejected instead of silently accepted.
+	#[test]
+	fn zero_initial_backoff_is_rejected() {
+		let cfg = ReconnectConfig {
+			initial_backoff: Duration::ZERO,
+			..Default::default()
+		};
+		// Precondition of the bug this guards: doubling zero never grows it.
+		assert_eq!(next_backoff(Duration::ZERO, cfg.max_backoff), Duration::ZERO);
+
+		let err = validate_reconnect(&cfg).expect_err("a zero initial backoff must be rejected");
+		assert!(
+			format!("{err}").contains("reconnect initial backoff"),
+			"unexpected error: {err}"
+		);
+	}
+
+	/// A zero `max_backoff` clamps every delay — including a positive
+	/// `initial_backoff` — to zero, so it is rejected too.
+	#[test]
+	fn zero_max_backoff_is_rejected() {
+		let cfg = ReconnectConfig {
+			max_backoff: Duration::ZERO,
+			..Default::default()
+		};
+		assert_eq!(next_backoff(cfg.initial_backoff, Duration::ZERO), Duration::ZERO);
+
+		let err = validate_reconnect(&cfg).expect_err("a zero max backoff must be rejected");
+		assert!(format!("{err}").contains("reconnect max backoff"), "unexpected error: {err}");
+	}
+
+	#[test]
+	fn default_reconnect_backoff_is_accepted() {
+		let cfg = ReconnectConfig::default();
+		assert!(validate_reconnect(&cfg).is_ok());
+		// A disabled reconnect with sane delays stays acceptable.
+		let disabled = ReconnectConfig { enabled: false, ..cfg };
+		assert!(validate_reconnect(&disabled).is_ok());
+	}
+
+	/// The guard must run on the real construction path, before the QUIC
+	/// handshake is attempted: a peer that nothing listens on would otherwise
+	/// fail with a dial error instead of the config error.
+	#[test_log::test(tokio::test)]
+	async fn outbound_construction_rejects_a_zero_initial_backoff() {
+		let opts = TuicheOutboundOpts {
+			peer_addr: "127.0.0.1:9443".parse().unwrap(),
+			sni: "localhost".into(),
+			auth: (Uuid::nil(), Arc::<[u8]>::from(&[][..])),
+			verify_certificate: false,
+			alpn: Vec::new(),
+			heartbeat: Duration::from_secs(10),
+			gc_interval: Duration::from_secs(10),
+			gc_lifetime: Duration::from_secs(10),
+			reconnect: ReconnectConfig {
+				initial_backoff: Duration::ZERO,
+				..Default::default()
+			},
+			connection: ConnectionOpts::default(),
+		};
+
+		let err = match tokio::time::timeout(
+			Duration::from_secs(5),
+			TuicheOutbound::new(Arc::new(AppContext::default()), opts),
+		)
+		.await
+		{
+			Err(_) => panic!("the zero-backoff guard must reject before dialing, but construction hung"),
+			Ok(Ok(_)) => panic!("a zero initial backoff must be rejected before dialing"),
+			Ok(Err(err)) => err,
+		};
+		assert!(
+			format!("{err}").contains("reconnect initial backoff"),
+			"the zero-backoff guard must run before the connect attempt, got: {err}"
+		);
 	}
 
 	/// One wire `Packet` frame exactly as [`dispatch_incoming_udp`] consumes
