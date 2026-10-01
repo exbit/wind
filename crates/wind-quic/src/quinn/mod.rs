@@ -321,15 +321,27 @@ fn build_transport(t: &TransportConfig) -> Result<QuinnTransport, QuicError> {
 		.map_err(|_| QuicError::Other("max_concurrent_bidi_streams out of range".into()))?;
 	let uni = VarInt::from_u64(t.max_concurrent_uni_streams)
 		.map_err(|_| QuicError::Other("max_concurrent_uni_streams out of range".into()))?;
-	let recv_window = VarInt::from_u64(t.receive_window).map_err(|_| QuicError::Other("receive_window out of range".into()))?;
+	// quinn's windows are fixed — it has no init/max auto-tuning — so the
+	// per-direction `max_*` overrides map straight onto them and each falls
+	// back to the legacy single `receive_window`.
+	let stream_window = VarInt::from_u64(t.max_stream_receive_window.unwrap_or(t.receive_window))
+		.map_err(|_| QuicError::Other("stream receive window out of range".into()))?;
 
 	tr.max_concurrent_bidi_streams(bidi)
 		.max_concurrent_uni_streams(uni)
 		.send_window(t.send_window)
-		.stream_receive_window(recv_window)
+		.stream_receive_window(stream_window)
 		.initial_mtu(t.initial_mtu)
 		.min_mtu(t.min_mtu)
 		.enable_segmentation_offload(t.gso);
+
+	// Connection-level receive window. Only set when explicitly configured, so
+	// the default keeps quinn's built-in ceiling in place.
+	if let Some(max_conn) = t.max_conn_receive_window {
+		let conn_window =
+			VarInt::from_u64(max_conn).map_err(|_| QuicError::Other("connection receive window out of range".into()))?;
+		tr.receive_window(conn_window);
+	}
 
 	if let Some(idle) = t.max_idle_timeout {
 		let idle = IdleTimeout::try_from(idle).map_err(|_| QuicError::Other("max_idle_timeout out of range".into()))?;
@@ -372,5 +384,107 @@ fn congestion_factory(t: &TransportConfig) -> Option<Arc<dyn quinn::congestion::
 			}
 			Some(Arc::new(cfg))
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	const MIB: u64 = 1024 * 1024;
+
+	/// Read one numeric field out of quinn's `TransportConfig` debug rendering.
+	///
+	/// quinn keeps every transport field private and exposes only setters, but
+	/// its `Debug` impl deliberately lists `stream_receive_window` and
+	/// `receive_window` for diagnostics, so that rendering is the only way to
+	/// observe what `build_transport` actually applied. The leading space in
+	/// the key keeps the lookup for `receive_window` from matching the tail of
+	/// `stream_receive_window`.
+	fn window_field(tr: &QuinnTransport, field: &str) -> u64 {
+		let rendered = format!("{tr:?}");
+		let key = format!(" {field}: ");
+		let start = rendered
+			.find(&key)
+			.unwrap_or_else(|| panic!("quinn's TransportConfig debug output has no `{field}` field: {rendered}"))
+			+ key.len();
+		let rest = &rendered[start..];
+		let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+		rest[..end]
+			.parse()
+			.unwrap_or_else(|e| panic!("`{field}` is not a plain integer in quinn's TransportConfig ({e}): {rendered}"))
+	}
+
+	/// `max_conn_receive_window` is documented as quinn's fixed
+	/// connection-level `receive_window`, so configuring it must reach
+	/// quinn.
+	#[test]
+	fn configures_the_connection_receive_window() {
+		let conn_window = 20 * MIB;
+		let t = TransportConfig {
+			max_conn_receive_window: Some(conn_window),
+			..Default::default()
+		};
+		let tr = build_transport(&t).expect("transport config");
+		assert_eq!(
+			window_field(&tr, "receive_window"),
+			conn_window,
+			"max_conn_receive_window must reach quinn's connection receive_window"
+		);
+	}
+
+	/// `max_stream_receive_window` is documented as quinn's fixed
+	/// `stream_receive_window` and must win over the legacy single knob.
+	#[test]
+	fn configures_the_per_stream_receive_window() {
+		let t = TransportConfig {
+			receive_window: 5 * MIB,
+			max_stream_receive_window: Some(9 * MIB),
+			..Default::default()
+		};
+		let tr = build_transport(&t).expect("transport config");
+		assert_eq!(
+			window_field(&tr, "stream_receive_window"),
+			9 * MIB,
+			"max_stream_receive_window must win over the legacy receive_window"
+		);
+	}
+
+	/// Without the per-direction overrides the legacy knob keeps sizing the
+	/// per-stream window and quinn's own connection ceiling stays untouched —
+	/// the documented fallback, and no change to existing defaults.
+	#[test]
+	fn leaves_unset_windows_at_their_quinn_defaults() {
+		let t = TransportConfig {
+			receive_window: 5 * MIB,
+			..Default::default()
+		};
+		let tr = build_transport(&t).expect("transport config");
+		let default_conn = window_field(&QuinnTransport::default(), "receive_window");
+		assert_eq!(window_field(&tr, "receive_window"), default_conn);
+		assert_eq!(window_field(&tr, "stream_receive_window"), 5 * MIB);
+	}
+
+	/// A window that cannot be represented as a QUIC varint must fail loudly
+	/// instead of being dropped on the floor.
+	#[test]
+	fn rejects_windows_outside_the_varint_range() {
+		let conn = TransportConfig {
+			max_conn_receive_window: Some(u64::MAX),
+			..Default::default()
+		};
+		assert!(
+			build_transport(&conn).is_err(),
+			"an out-of-range connection receive window must be rejected"
+		);
+
+		let stream = TransportConfig {
+			max_stream_receive_window: Some(u64::MAX),
+			..Default::default()
+		};
+		assert!(
+			build_transport(&stream).is_err(),
+			"an out-of-range stream receive window must be rejected"
+		);
 	}
 }
