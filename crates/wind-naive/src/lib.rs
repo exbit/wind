@@ -7,7 +7,11 @@
 
 use std::{
 	io::{Read, Write},
-	sync::Arc,
+	sync::{
+		Arc,
+		atomic::{AtomicUsize, Ordering},
+	},
+	thread::JoinHandle,
 };
 
 use async_trait::async_trait;
@@ -253,6 +257,78 @@ impl Outbound for NaiveOutbound {
 	}
 }
 
+/// Number of bridge I/O threads that have been fully joined.
+///
+/// A parked reader blocks for a while after the relay stops (the Cronet
+/// read timeout in `cronet-rs` bounds it), so this only ever *grows* long
+/// after [`reap_blocking_thread`] was queued. It is exposed so a regression
+/// test can prove the thread handle is joined rather than detached: with a
+/// detached handle the count can never move.
+static REAPED_IO_THREADS: AtomicUsize = AtomicUsize::new(0);
+
+/// How many bridge I/O threads have finished and been joined.
+#[cfg(test)]
+fn reaped_io_threads() -> usize {
+	REAPED_IO_THREADS.load(Ordering::Acquire)
+}
+
+/// Join a detached-able blocking thread from a thread that is allowed to block.
+///
+/// `Drop` runs on an async worker, so it cannot `join` inline: the Cronet
+/// reader may sit in a blocking FFI read for up to its own timeout, and
+/// parking a tokio worker for that long would leak the runtime's capacity.
+/// The reaper lives on a blocking thread (or a plain one outside a runtime),
+/// so the standard thread and the `NaiveConn` it owns — including its socket —
+/// are reclaimed instead of being abandoned by a dropped [`JoinHandle`].
+fn reap_blocking_thread(handle: JoinHandle<()>) {
+	if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+		// Detached on purpose: this task only *waits* for `handle`, and it is
+		// the runtime's blocking pool — not a `join()` on an async worker —
+		// that pays for that wait.
+		#[expect(
+			clippy::let_underscore_future,
+			reason = "the reaping task is intentionally detached; its only job is to join `handle`"
+		)]
+		let _ = runtime.spawn_blocking(move || {
+			let _ = handle.join();
+			REAPED_IO_THREADS.fetch_add(1, Ordering::AcqRel);
+		});
+	} else {
+		// No reactor to hand the wait to; a plain thread keeps the reaping
+		// behaviour identical for callers outside a tokio runtime.
+		let _ = std::thread::Builder::new().name("wind-naive-reaper".into()).spawn(move || {
+			let _ = handle.join();
+			REAPED_IO_THREADS.fetch_add(1, Ordering::AcqRel);
+		});
+	}
+}
+
+/// Owns a bridge's blocking I/O thread for as long as the relay is running.
+///
+/// Dropping the previous `JoinHandle` *detached* the thread, which left the
+/// thread and the socket inside its `NaiveConn` alive until the parked Cronet
+/// read eventually timed out — and, because nothing ever joined, the kernel
+/// thread itself was never reclaimed. Holding the handle here and reaping it
+/// on drop keeps the "the relay is over ⇒ the I/O thread is reclaimed"
+/// invariant explicit.
+struct JoinSession {
+	handle: Option<JoinHandle<()>>,
+}
+
+impl JoinSession {
+	fn new(handle: JoinHandle<()>) -> Self {
+		Self { handle: Some(handle) }
+	}
+}
+
+impl Drop for JoinSession {
+	fn drop(&mut self) {
+		if let Some(handle) = self.handle.take() {
+			reap_blocking_thread(handle);
+		}
+	}
+}
+
 /// Bridge a [`UdpStream`] across a blocking
 /// [`cronet_rs::naive_conn::NaiveConn`] using UoT v2 framing.
 ///
@@ -267,6 +343,10 @@ impl Outbound for NaiveOutbound {
 /// blocking framed read" on a single handle. While it is blocked awaiting a
 /// downlink frame, freshly queued uplink packets wait for the next read to
 /// return — an inherent limitation of the blocking, non-splittable handle.
+///
+/// When the relay ends the thread is handed to a [`JoinSession`], which joins
+/// it off the async worker, so neither the thread nor the `NaiveConn`'s socket
+/// outlives the relay.
 async fn naive_uot_bridge(
 	mut naive: cronet_rs::naive_conn::NaiveConn,
 	first: UdpPacket,
@@ -292,11 +372,19 @@ async fn naive_uot_bridge(
 
 			loop {
 				let mut wrote = false;
-				while let Ok(frame) = uplink_rx.try_recv() {
-					if naive.write_all(&frame).is_err() {
-						return;
+				loop {
+					match uplink_rx.try_recv() {
+						Ok(frame) => {
+							if naive.write_all(&frame).is_err() {
+								return;
+							}
+							wrote = true;
+						}
+						// The relay dropped the uplink sender: stop now instead
+						// of parking in one more read before it notices.
+						Err(mpsc::error::TryRecvError::Disconnected) => return,
+						Err(mpsc::error::TryRecvError::Empty) => break,
 					}
-					wrote = true;
 				}
 				if wrote {
 					let _ = naive.flush();
@@ -354,26 +442,41 @@ async fn naive_uot_bridge(
 		_ = downlink => {}
 	}
 
-	// Do not `join` the I/O thread: it may be parked in a blocking read with no
-	// downlink traffic. Dropping the channels makes its next write fail and the
-	// `NaiveConn` is cancelled when the thread finally unwinds and drops it.
-	drop(io_handle);
+	// Hold the I/O thread in a session guard until this relay returns, then
+	// reap it: the guard's `Drop` queues the `join` on a blocking thread (see
+	// [`reap_blocking_thread`]). Dropping the channels makes the thread's next
+	// send fail *and* its next drain see `Disconnected`, so it unwinds
+	// promptly and drops the `NaiveConn` — cancelling the Cronet stream and
+	// closing its socket. Detaching the handle instead (the previous
+	// behaviour) left that thread and socket alive for as long as the parked
+	// Cronet read took, with no owner left to ever join them.
+	let _session = JoinSession::new(io_handle);
 	Ok(())
 }
 
-/// Bridge data between a blocking [`cronet_rs::naive_conn::NaiveConn`] and a
-/// tokio [`AsyncRead`] + [`AsyncWrite`] stream.
+/// Bridge data between a blocking Cronet connection
+/// ([`cronet_rs::naive_conn::NaiveConn`]) and a tokio [`AsyncRead`] +
+/// [`AsyncWrite`] stream.
 ///
 /// Spawns a dedicated **std::thread** that owns the `NaiveConn` and relays
 /// data through `mpsc` channels.  The Cronet C API expects all stream
 /// operations from the same thread.
-async fn naive_async_bridge(
-	mut naive: cronet_rs::naive_conn::NaiveConn,
-	mut stream: impl AsyncRead + AsyncWrite + Unpin,
-) -> eyre::Result<()> {
+///
+/// The thread is reaped through a [`JoinSession`] when the bridge returns, so
+/// the thread and the connection's socket do not leak past the relay.
+///
+/// Generic over the connection so the relay's shutdown contract — including
+/// that the I/O thread is handed to a [`JoinSession`] instead of being
+/// detached — can be driven by a test double without a Cronet engine.
+async fn naive_async_bridge<C>(naive: C, mut stream: impl AsyncRead + AsyncWrite + Unpin) -> eyre::Result<()>
+where
+	C: Read + Write + Send + 'static,
+{
 	let span = tracing::debug_span!("naive_bridge");
 
 	async move {
+		let mut naive = naive;
+
 		// Bounded channels apply back-pressure to producers when the I/O
 		// thread or the async reader can't keep up. The previous
 		// `unbounded_channel` would let a stalled consumer accrete an
@@ -390,11 +493,19 @@ async fn naive_async_bridge(
 				let mut read_buf = [0u8; 65535];
 
 				loop {
-					while let Ok(data) = naive_write_rx.try_recv() {
-						if naive.write_all(&data).is_err() {
-							return;
+					loop {
+						match naive_write_rx.try_recv() {
+							Ok(data) => {
+								if naive.write_all(&data).is_err() {
+									return;
+								}
+								let _ = naive.flush();
+							}
+							// The relay dropped the uplink sender: stop now
+							// instead of parking in one more read.
+							Err(mpsc::error::TryRecvError::Disconnected) => return,
+							Err(mpsc::error::TryRecvError::Empty) => break,
 						}
-						let _ = naive.flush();
 					}
 
 					match naive.read(&mut read_buf) {
@@ -449,13 +560,13 @@ async fn naive_async_bridge(
 			}
 		}
 
-		// Do not `join` the I/O thread from this async task: it may be parked
-		// in a blocking `naive.read()` with no traffic, and `join()` would
-		// pin a tokio worker thread until the remote finally speaks or times
-		// out. Dropping the channels instead makes the thread's next
-		// send/recv fail, and the `NaiveConn` is cancelled when the thread
-		// unwinds and drops it (same strategy as the UoT relay above).
-		drop(io_handle);
+		// `join` must not run inline here: the I/O thread may be parked in a
+		// blocking `naive.read()`, and joining it from an async worker would
+		// pin that worker until the remote speaks or the Cronet read times
+		// out. The session guard reaps it on a blocking thread instead, so the
+		// thread and the `NaiveConn`'s socket are actually reclaimed rather
+		// than detached (same strategy as the UoT relay above).
+		let _session = JoinSession::new(io_handle);
 		Ok(())
 	}
 	.instrument(span)
@@ -624,6 +735,95 @@ mod tests {
 		assert!(
 			std::path::Path::new(path).exists(),
 			"downloaded libcronet should exist on disk: {path}"
+		);
+	}
+
+	/// A stand-in for the blocking Cronet connection: its first `read` parks
+	/// until the test releases it (then reports EOF), and writes are discarded.
+	struct BlockingIo {
+		connected: std::sync::mpsc::Sender<()>,
+		release: std::sync::mpsc::Receiver<()>,
+	}
+
+	impl std::io::Read for BlockingIo {
+		fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+			let _ = self.connected.send(());
+			// A closed sender (test finished) or the timeout both mean "go on".
+			let _ = self.release.recv_timeout(std::time::Duration::from_secs(5));
+			Ok(0)
+		}
+	}
+
+	impl std::io::Write for BlockingIo {
+		fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+			Ok(buf.len())
+		}
+
+		fn flush(&mut self) -> std::io::Result<()> {
+			Ok(())
+		}
+	}
+
+	/// The TCP bridge must hand its blocking I/O thread to a [`JoinSession`]
+	/// when the relay ends, instead of detaching the handle.
+	///
+	/// The connection double parks in its first `read` until the test releases
+	/// it, so the thread provably cannot finish on its own while the relay
+	/// runs. A detached handle leaves `reaped_io_threads` frozen and this test
+	/// fails; the session's reaper moves it.
+	///
+	/// A multi-thread runtime is required: the test blocks its own thread while
+	/// waiting for the I/O thread to park, so the bridge task and that thread
+	/// must be able to make progress in parallel.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn bridge_hands_its_io_thread_to_the_session() {
+		let (connected_tx, connected_rx) = std::sync::mpsc::channel::<()>();
+		let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+
+		// A live local stream keeps the relay's `select!` pending until the
+		// test drops the peer, so the bridge future does not return before the
+		// I/O thread has been created and parked.
+		let (local, peer) = tokio::io::duplex(64);
+
+		let before = reaped_io_threads();
+		let bridge = tokio::spawn(naive_async_bridge(
+			BlockingIo {
+				connected: connected_tx,
+				release: release_rx,
+			},
+			local,
+		));
+
+		connected_rx
+			.recv_timeout(std::time::Duration::from_secs(10))
+			.expect("the bridge must have spawned its I/O thread and parked it in read");
+
+		// The thread is parked in its first `read`, so neither the relay nor a
+		// detached handle can have reaped anything yet.
+		assert_eq!(
+			reaped_io_threads(),
+			before,
+			"a parked io thread must not be reported as reaped"
+		);
+
+		// End the relay, then let the I/O thread unwind.
+		drop(peer);
+		bridge
+			.await
+			.expect("bridge task should not panic")
+			.expect("bridge should end cleanly");
+		let _ = release_tx.send(());
+
+		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+		while reaped_io_threads() == before && std::time::Instant::now() < deadline {
+			// A plain sleep: reaping happens on the blocking pool, so nothing
+			// has to be driven on this runtime for it to progress.
+			std::thread::sleep(std::time::Duration::from_millis(10));
+		}
+		assert_eq!(
+			reaped_io_threads(),
+			before + 1,
+			"the bridge must join its io thread instead of detaching the handle"
 		);
 	}
 }
