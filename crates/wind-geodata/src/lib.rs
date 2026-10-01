@@ -253,6 +253,43 @@ mod tests {
 	}
 
 	#[test]
+	fn duplicate_geosite_categories_are_merged() {
+		// Regression: entries sharing a tag used to produce one `CategoryInfo`
+		// per entry, so the by-name binary search could only ever reach one of
+		// them (the other entry's domains were unreachable). Tags are compared
+		// after uppercasing, so differently-cased spellings must merge too.
+		let geosite = GeoSiteList {
+			entry: vec![
+				GeoSite {
+					country_code: "google".to_string(),
+					domain: vec![domain(3, "first.example")], // Full → exact
+				},
+				GeoSite {
+					country_code: "GOOGLE".to_string(),
+					domain: vec![domain(2, "second.example")], // Domain → suffix
+				},
+			],
+		};
+		let geoip = GeoIpList { entry: Vec::new() };
+		let gs = encode_geosite(geosite);
+		let gi = encode_geoip(geoip);
+
+		let snapshot = crate::builder::build_snapshot(&gs, &gi).unwrap();
+		assert_eq!(
+			snapshot.geosite.categories.len(),
+			1,
+			"a repeated geosite tag must produce a single merged category"
+		);
+		assert_eq!(snapshot.geosite.categories[0].name, "GOOGLE");
+
+		let tmp = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+		let geo = GeoData::build_and_open(&gs, &gi, &tmp).unwrap();
+		let site = geo.geosite_lookup();
+		assert!(site("google", "first.example"));
+		assert!(site("google", "second.example"));
+	}
+
+	#[test]
 	fn open_roundtrips_via_cache() {
 		let (tmp, _geo) = open_fixture();
 		let reopened = GeoData::open(&tmp).unwrap();

@@ -14,28 +14,48 @@ pub fn build_snapshot(geosite_bytes: &[u8], geoip_bytes: &[u8]) -> Result<GeoDat
 	Ok(GeoDataSnapshot { geosite, geoip })
 }
 
+/// Domains of one geosite category, split by the match type they compile to.
+#[derive(Default)]
+struct SiteDomains {
+	exact: Vec<String>,
+	suffix: Vec<String>,
+	keyword: Vec<String>,
+}
+
 fn build_geosite(list: &GeoSiteList) -> GeoSiteIndex {
-	let mut categories: Vec<CategoryInfo> = Vec::new();
-	let mut exact_domains: Vec<String> = Vec::new();
-	let mut suffix_domains: Vec<String> = Vec::new();
-	let mut keyword_domains: Vec<String> = Vec::new();
+	// Accumulate domains per category (uppercased). A BTreeMap keeps the
+	// categories sorted for the binary search and merges entries that share a
+	// tag, so every domain of a duplicated tag stays reachable.
+	let mut by_name: BTreeMap<String, SiteDomains> = BTreeMap::new();
 
 	for site in &list.entry {
-		let mut exact: Vec<String> = Vec::new();
-		let mut suffix: Vec<String> = Vec::new();
-		let mut keyword: Vec<String> = Vec::new();
+		let entry = by_name.entry(site.country_code.to_ascii_uppercase()).or_default();
 
 		for domain in &site.domain {
 			let value = domain.value.to_ascii_lowercase();
 			match domain.r#type {
-				0 => keyword.push(value), // Plain → keyword (substring) match
-				1 => {}                   // Regex → skip (not in flat arrays)
-				2 => suffix.push(value),  // Domain → suffix match
-				3 => exact.push(value),   // Full → exact match
+				0 => entry.keyword.push(value), // Plain → keyword (substring) match
+				1 => {}                         // Regex → skip (not in flat arrays)
+				2 => entry.suffix.push(value),  // Domain → suffix match
+				3 => entry.exact.push(value),   // Full → exact match
 				_ => {}
 			}
 		}
+	}
 
+	let mut categories: Vec<CategoryInfo> = Vec::with_capacity(by_name.len());
+	let mut exact_domains: Vec<String> = Vec::new();
+	let mut suffix_domains: Vec<String> = Vec::new();
+	let mut keyword_domains: Vec<String> = Vec::new();
+
+	// BTreeMap iteration is sorted by key, so `categories` ends up sorted by
+	// name for the binary search.
+	for (name, domains) in by_name {
+		let SiteDomains {
+			mut exact,
+			mut suffix,
+			mut keyword,
+		} = domains;
 		exact.sort();
 		exact.dedup();
 		suffix.sort();
@@ -56,7 +76,7 @@ fn build_geosite(list: &GeoSiteList) -> GeoSiteIndex {
 
 		categories.push(CategoryInfo {
 			// Stored uppercase so lookups can be case-insensitive (geosite.dat tags are uppercase).
-			name: site.country_code.to_ascii_uppercase(),
+			name,
 			exact_start,
 			exact_len,
 			suffix_start,
@@ -65,9 +85,6 @@ fn build_geosite(list: &GeoSiteList) -> GeoSiteIndex {
 			keyword_len,
 		});
 	}
-
-	// Sort categories by name for binary search.
-	categories.sort_by(|a, b| a.name.cmp(&b.name));
 
 	GeoSiteIndex {
 		categories,
