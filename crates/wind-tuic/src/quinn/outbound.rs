@@ -634,12 +634,15 @@ async fn dispatch_incoming_udp(udp_session: &Cache<u16, Arc<TuicUdpStream<QuinnC
 		Err(_) => (TargetAddr::IPv4(std::net::Ipv4Addr::UNSPECIFIED, 0), false),
 	};
 
+	// `frag_id` is a raw wire byte, so widen it before the 1-based display:
+	// `frag_id + 1` overflows `u8` for a peer-sent `0xFF` (panic under
+	// `overflow-checks`, silent wrap to `0` in release).
 	if has_address {
 		info!(target: "tuic_out", "Received UDP packet: assoc={:#06x}, pkt={}, frag={}/{}, size={}, target={}",
-			assoc_id, pkt_id, frag_id + 1, frag_total, size, target);
+			assoc_id, pkt_id, u16::from(frag_id) + 1, frag_total, size, target);
 	} else {
 		info!(target: "tuic_out", "Received UDP fragment: assoc={:#06x}, pkt={}, frag={}/{}, size={} (no address - non-first fragment)",
-			assoc_id, pkt_id, frag_id + 1, frag_total, size);
+			assoc_id, pkt_id, u16::from(frag_id) + 1, frag_total, size);
 	}
 
 	if let Some(tuic_udp_stream) = udp_session.get(&assoc_id).await {
@@ -822,9 +825,17 @@ impl Outbound for TuicOutbound {
 
 #[cfg(test)]
 mod tests {
-	use std::{net::SocketAddr, time::Duration};
+	use std::{
+		net::{Ipv4Addr, SocketAddr},
+		sync::Arc,
+		time::Duration,
+	};
 
-	use super::{ReconnectConfig, next_backoff, peer_family_differs};
+	use bytes::BufMut as _;
+	use moka::future::Cache;
+
+	use super::{QuinnConnection, ReconnectConfig, dispatch_incoming_udp, next_backoff, peer_family_differs};
+	use crate::proto::{AddressType, CmdType, UdpStream as TuicUdpStream, VER};
 
 	#[test]
 	fn next_backoff_doubles_until_capped() {
@@ -862,5 +873,43 @@ mod tests {
 		assert_eq!(cfg.initial_backoff, Duration::from_millis(500));
 		assert_eq!(cfg.max_backoff, Duration::from_secs(30));
 		assert!(cfg.initial_backoff <= cfg.max_backoff);
+	}
+
+	/// One wire `Packet` frame exactly as [`dispatch_incoming_udp`] consumes
+	/// it.
+	///
+	/// `address = None` selects the address-less (`AddressType::None`) form,
+	/// which logs through the second, otherwise identical, `info!` call.
+	fn packet_frame(frag_id: u8, frag_total: u8, address: Option<(Ipv4Addr, u16)>) -> bytes::Bytes {
+		const PAYLOAD: &[u8] = b"pong";
+		let mut frame = bytes::BytesMut::new();
+		frame.put_u8(VER);
+		frame.put_u8(CmdType::Packet.into());
+		frame.put_u16(0x1234); // assoc_id
+		frame.put_u16(7); // pkt_id
+		frame.put_u8(frag_total);
+		frame.put_u8(frag_id);
+		frame.put_u16(PAYLOAD.len() as u16);
+		match address {
+			Some((ip, port)) => {
+				frame.put_u8(AddressType::IPv4.into());
+				frame.put_slice(&ip.octets());
+				frame.put_u16(port);
+			}
+			None => frame.put_u8(AddressType::None.into()),
+		}
+		frame.put_slice(PAYLOAD);
+		frame.freeze()
+	}
+
+	/// `frag_id` is a raw wire `u8`, so the 1-based fragment number in the log
+	/// must be computed after widening: `frag_id + 1` overflows for `0xFF`
+	/// (panic under `overflow-checks`, silent wrap to `0` in release).
+	#[test_log::test(tokio::test)]
+	async fn frag_id_255_does_not_overflow_the_log_path() {
+		let sessions: Cache<u16, Arc<TuicUdpStream<QuinnConnection>>> = Cache::new(u64::from(u16::MAX));
+		for address in [Some((Ipv4Addr::LOCALHOST, 8080)), None] {
+			dispatch_incoming_udp(&sessions, packet_frame(0xFF, 2, address)).await;
+		}
 	}
 }
