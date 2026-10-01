@@ -181,7 +181,18 @@ impl<C: QuicConnection> SendStream<Bytes> for H3Send<C> {
 
 	fn send_data<T: Into<WriteBuf<Bytes>>>(&mut self, data: T) -> Result<(), StreamErrorIncoming> {
 		// h3 always polls `poll_ready` to readiness before `send_data`, so the
-		// previous buffer has drained.
+		// previous buffer has drained. Should it ever call this while a frame
+		// is still buffered, overwriting `pending` would discard that
+		// frame and hand h3 a response it believes was sent in full;
+		// report the misuse instead, as `h3-quinn` does. h3 turns this
+		// into H3_INTERNAL_ERROR.
+		if self.pending.is_some() {
+			return Err(StreamErrorIncoming::ConnectionErrorIncoming {
+				connection_error: ConnectionErrorIncoming::InternalError(
+					"send_data called while the h3 send stream is not ready".to_owned(),
+				),
+			});
+		}
 		self.pending = Some(data.into());
 		Ok(())
 	}
