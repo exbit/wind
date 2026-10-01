@@ -1327,7 +1327,7 @@ async fn handle_dissociate<C: QuicConnection>(connection: &InboundCtx<C>, assoc_
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
 	use std::{
 		future, io,
 		net::Ipv4Addr,
@@ -1350,7 +1350,8 @@ mod tests {
 	// `read_prefix`).
 	use super::*;
 
-	struct DummyQuicStream(tokio::io::DuplexStream);
+	/// Visible to the sibling `server::masquerade` test module as well.
+	pub(super) struct DummyQuicStream(tokio::io::DuplexStream);
 
 	impl DummyQuicStream {
 		fn pair() -> (Self, Self) {
@@ -1408,8 +1409,10 @@ mod tests {
 		handshake_fails: AtomicBool,
 	}
 
+	/// Visible to the sibling `server::masquerade` test module, which drives
+	/// `run_masquerade` with it.
 	#[derive(Clone, Default)]
-	struct DummyConn {
+	pub(super) struct DummyConn {
 		obs: Option<Arc<ConnObservations>>,
 	}
 
