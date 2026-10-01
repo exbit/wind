@@ -42,8 +42,8 @@ pub struct LoadBalanceOpts {
 	pub url: String,
 	/// Interval between successive health-check rounds.
 	pub interval: Duration,
-	/// When `true`, health checks are deferred until the first connection
-	/// attempt.  All proxies are assumed alive until proven otherwise.
+	/// When `true`, no periodic health checks are started and every child is
+	/// treated as alive.
 	pub lazy: bool,
 }
 
@@ -81,10 +81,15 @@ impl ProxyState {
 /// HTTP GET, and marks the proxy alive or dead.  The main selection logic
 /// skips dead proxies; when **all** proxies are dead it falls back to the
 /// full set so that a transient network blip doesn't cause a full outage.
+///
+/// When `lazy`, no health checking happens at all: [`Self::start_health_check`]
+/// is a no-op and every child counts as alive.
 pub struct LoadBalanceOutbound {
 	proxies: Vec<ProxyState>,
 	strategy: LoadBalanceStrategy,
 	url: String,
+	interval: Duration,
+	lazy: bool,
 	round_robin_counter: AtomicUsize,
 	sticky_cache: Mutex<HashMap<TargetAddr, (Instant, usize)>>,
 }
@@ -108,6 +113,8 @@ impl LoadBalanceOutbound {
 				.collect(),
 			strategy: opts.strategy,
 			url: opts.url,
+			interval: opts.interval,
+			lazy: opts.lazy,
 			round_robin_counter: AtomicUsize::new(0),
 			sticky_cache: Mutex::new(HashMap::new()),
 		}
@@ -115,11 +122,17 @@ impl LoadBalanceOutbound {
 
 	/// Start the background health-check loop.
 	///
-	/// Call this **after** wrapping the outbound in an `Arc`.  If
-	/// [`LoadBalanceOpts::lazy`] is `true` this is a no-op — health checks
-	/// are performed on-demand instead.
-	pub fn start_health_check(self: &Arc<Self>, interval: Duration) {
+	/// Call this **after** wrapping the outbound in an `Arc`.  No-op when
+	/// [`LoadBalanceOpts::lazy`] is `true`; otherwise the loop runs at the
+	/// configured [`LoadBalanceOpts::interval`].
+	pub fn start_health_check(self: &Arc<Self>) {
+		if self.lazy {
+			tracing::debug!("lazy load-balance outbound: health checks stay disabled");
+			return;
+		}
+
 		let this = self.clone();
+		let interval = self.interval;
 		tokio::spawn(async move {
 			health_check_loop(this, interval).await;
 		});
@@ -393,6 +406,55 @@ mod tests {
 	fn make_lb(strategy: LoadBalanceStrategy, n: usize) -> LoadBalanceOutbound {
 		let proxies: Vec<Arc<dyn Outbound>> = (0..n).map(|_| Arc::new(DummyOutbound::new()) as Arc<dyn Outbound>).collect();
 		LoadBalanceOutbound::new(make_opts(strategy), proxies)
+	}
+
+	fn make_lb_arc(opts: LoadBalanceOpts, n: usize) -> Arc<LoadBalanceOutbound> {
+		let proxies: Vec<Arc<dyn Outbound>> = (0..n).map(|_| Arc::new(DummyOutbound::new()) as Arc<dyn Outbound>).collect();
+		Arc::new(LoadBalanceOutbound::new(opts, proxies))
+	}
+
+	// ---- health-check scheduling -----------------------------------------
+
+	/// `lazy: true` means no periodic probing happens, even if the health
+	/// check is requested explicitly — the outbound itself owns that decision.
+	#[tokio::test]
+	async fn lazy_outbound_never_probes_its_children() {
+		let opts = LoadBalanceOpts {
+			lazy: true,
+			interval: Duration::from_millis(10),
+			..make_opts(LoadBalanceStrategy::RoundRobin)
+		};
+		let lb = make_lb_arc(opts, 2);
+
+		lb.start_health_check();
+
+		// The first probe of a started loop runs immediately, so 300 ms is
+		// far more than enough to observe one.
+		tokio::time::sleep(Duration::from_millis(300)).await;
+		assert!(
+			lb.proxies.iter().all(|p| p.is_alive()),
+			"a lazy load-balancer must not probe its children"
+		);
+	}
+
+	/// A non-lazy outbound probes its children (the dummy children never
+	/// answer, so they must end up marked dead).
+	#[tokio::test]
+	async fn non_lazy_outbound_probes_its_children() {
+		let opts = LoadBalanceOpts {
+			lazy: false,
+			interval: Duration::from_millis(10),
+			..make_opts(LoadBalanceStrategy::RoundRobin)
+		};
+		let lb = make_lb_arc(opts, 1);
+
+		lb.start_health_check();
+
+		let deadline = Instant::now() + Duration::from_secs(5);
+		while lb.proxies[0].is_alive() && Instant::now() < deadline {
+			tokio::time::sleep(Duration::from_millis(10)).await;
+		}
+		assert!(!lb.proxies[0].is_alive(), "a non-lazy load-balancer must probe its children");
 	}
 
 	// ---- round-robin -----------------------------------------------------
