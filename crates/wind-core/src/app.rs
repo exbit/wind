@@ -29,6 +29,10 @@ use crate::{
 
 type InboundFactory<R> = Box<dyn FnOnce(InboundHooks, Arc<AppContext>) -> Box<dyn AbstractInbound<R>> + Send>;
 
+/// How long [`App::run`] waits for in-flight tasks after cancelling the context
+/// token, unless overridden with [`App::set_shutdown_timeout`].
+const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// A composable unit of configuration, applied to the [`App`] via
 /// [`App::add_plugin`].
 ///
@@ -54,6 +58,7 @@ pub struct App<R: Router> {
 	/// of a private one created inside [`App::run`].
 	stats_collector: Option<Arc<StatsCollector>>,
 	flush_interval: Duration,
+	shutdown_timeout: Duration,
 	inbounds: Vec<InboundFactory<R>>,
 }
 
@@ -75,6 +80,7 @@ impl<R: Router> App<R> {
 			traffic_sink: None,
 			stats_collector: None,
 			flush_interval: Duration::from_secs(60),
+			shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
 			inbounds: Vec::new(),
 		}
 	}
@@ -141,6 +147,19 @@ impl<R: Router> App<R> {
 		self
 	}
 
+	/// How long [`App::run`] may spend draining in-flight connection handlers
+	/// after the context token is cancelled (default 10s).
+	///
+	/// Once the deadline passes `run` stops waiting, logs a warning, and lets
+	/// the runtime drop whatever is still registered — so a lower value
+	/// shortens shutdown at the cost of cutting long-lived handlers short.
+	/// Tasks that finish earlier are not delayed: the deadline is an upper
+	/// bound, not a fixed wait.
+	pub fn set_shutdown_timeout(mut self, timeout: Duration) -> Self {
+		self.shutdown_timeout = timeout;
+		self
+	}
+
 	pub fn add_inbound_with<I, F>(mut self, factory: F) -> Self
 	where
 		I: AbstractInbound<R> + Send + Sync + 'static,
@@ -166,6 +185,7 @@ impl<R: Router> App<R> {
 			traffic_sink,
 			stats_collector,
 			flush_interval,
+			shutdown_timeout,
 			inbounds,
 		} = self;
 		let router = router.ok_or_else(|| eyre::eyre!("App::run: no router set"))?;
@@ -242,7 +262,7 @@ impl<R: Router> App<R> {
 
 		ctx.token.cancel();
 		ctx.tasks.close();
-		if tokio::time::timeout(Duration::from_secs(10), ctx.tasks.wait()).await.is_err() {
+		if tokio::time::timeout(shutdown_timeout, ctx.tasks.wait()).await.is_err() {
 			warn!("timed out waiting for tasks to drain; forcing runtime drop");
 		}
 		Ok(())
@@ -284,7 +304,10 @@ async fn flush_once(sink: &dyn TrafficSink, stats: &StatsCollector) {
 #[cfg(test)]
 mod tests {
 	use std::{
-		sync::{Arc, Mutex},
+		sync::{
+			Arc, Mutex,
+			atomic::{AtomicBool, Ordering},
+		},
 		time::Duration,
 	};
 
@@ -358,6 +381,70 @@ mod tests {
 		assert!(
 			hooks.stats.is_none(),
 			"stats stay disabled without a sink or an injected collector"
+		);
+	}
+
+	#[test]
+	fn default_shutdown_timeout_stays_at_ten_seconds() {
+		assert_eq!(
+			App::<StubRouter>::new().shutdown_timeout,
+			Duration::from_secs(10),
+			"the pre-W31 hardcoded drain deadline is the backward-compatible default"
+		);
+	}
+
+	/// A task registered on the app's `TaskTracker` that never returns, so the
+	/// final drain can only end on the shutdown deadline.
+	#[tokio::test]
+	async fn configured_shutdown_timeout_bounds_the_final_drain() {
+		let started_task = Arc::new(AtomicBool::new(false));
+		let started_task_in_factory = started_task.clone();
+		let app = App::new()
+			.set_router(StubRouter)
+			.set_shutdown_timeout(Duration::from_millis(250))
+			.add_inbound_with(move |_hooks, ctx| {
+				ctx.tasks.spawn(std::future::pending::<()>());
+				started_task_in_factory.store(true, Ordering::SeqCst);
+				CaptureInbound
+			});
+
+		let ctx = app.context().clone();
+		let run_handle = tokio::spawn(async move { app.run().await });
+		let deadline = std::time::Instant::now() + Duration::from_secs(5);
+		while !started_task.load(Ordering::SeqCst) {
+			assert!(std::time::Instant::now() < deadline, "inbound factory never ran");
+			tokio::task::yield_now().await;
+		}
+
+		let cancelled_at = std::time::Instant::now();
+		ctx.token.cancel();
+		run_handle.await.expect("run task panicked").expect("run failed");
+		let elapsed = cancelled_at.elapsed();
+
+		assert!(
+			elapsed >= Duration::from_millis(200),
+			"the drain must wait for undrained tasks until the deadline, waited only {elapsed:?}"
+		);
+		assert!(
+			elapsed < Duration::from_secs(5),
+			"the configured shutdown timeout must replace the hardcoded 10 s drain, waited {elapsed:?}"
+		);
+	}
+
+	#[tokio::test]
+	async fn a_drained_app_does_not_wait_for_the_shutdown_timeout() {
+		let started_at = std::time::Instant::now();
+		run_and_capture_hooks(
+			App::new()
+				.set_router(StubRouter)
+				.set_shutdown_timeout(Duration::from_secs(30)),
+		)
+		.await;
+
+		assert!(
+			started_at.elapsed() < Duration::from_secs(5),
+			"the shutdown timeout is an upper bound, not a fixed wait: {:?}",
+			started_at.elapsed()
 		);
 	}
 }
