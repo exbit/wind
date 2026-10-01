@@ -618,3 +618,158 @@ async fn quinn_client_binds_the_configured_address_family() {
 	client_conn.close(0, b"done");
 	let _ = tokio::time::timeout(Duration::from_secs(2), client_conn.closed()).await;
 }
+
+/// Flood `client` with datagrams in bursts while a reader drains them slower
+/// than they arrive.
+///
+/// Models a handle that lags behind the peer: the flood must not be absorbed
+/// into an unbounded driver queue. Returns how many datagrams the flood sent
+/// (`sent`), how many arrived (`received`), how many the driver dropped in
+/// total (`dropped`), and the drop count observed at the moment the flood
+/// stopped (`dropped_at_stop`). A healthy run has `dropped_at_stop > 0`
+/// *while* the flood is still delivering datagrams; an unbounded queue drops
+/// nothing no matter how far behind the reader is, so it can never produce
+/// that.
+#[cfg(feature = "quiche")]
+async fn read_datagrams_during_flood(
+	server: &wind_quic::quiche::QuicheConnection,
+	client: &wind_quic::quiche::QuicheConnection,
+) -> (usize, usize, u64, u64) {
+	/// The burst has to be large enough to outrun the reader for the length of
+	/// a batch — otherwise the queue never fills and a bounded queue is
+	/// indistinguishable from an unbounded one — while staying under the
+	/// kernel's UDP receive buffer so the drops this test counts are the
+	/// driver's, not the kernel's. A 4096-datagram burst delivered every sent
+	/// datagram below the driver's cap on the development host.
+	const BATCH: usize = 512;
+	const MAX_BATCHES: usize = 64;
+
+	let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+	let reader = async {
+		let mut received = 0usize;
+		loop {
+			tokio::select! {
+				res = client.read_datagram() => match res {
+					Ok(_) => received += 1,
+					Err(_) => break,
+				},
+				_ = &mut stop_rx => {
+					// The flood is over; drain whatever is already queued so
+					// the caller can compare arrivals against sends.
+					while tokio::time::timeout(Duration::from_millis(100), client.read_datagram())
+						.await
+						.is_ok()
+					{
+						received += 1;
+					}
+					break
+				}
+			}
+			// Deliberately drain slower than the bursts deliver, so the
+			// driver's queue is what has to absorb the difference.
+			if received.is_multiple_of(4) {
+				tokio::time::sleep(Duration::from_millis(1)).await;
+			}
+		}
+		received
+	};
+
+	let flood = async {
+		let mut sent = 0usize;
+		let mut dropped_at_stop = 0u64;
+		for _ in 0..MAX_BATCHES {
+			for _ in 0..BATCH {
+				server
+					.send_datagram(Bytes::from_static(b"flood"))
+					.expect("send datagram during flood");
+			}
+			sent += BATCH;
+			// Let the peer's worker move the batch into its receive queue;
+			// whether that queue is bounded is the subject of the test.
+			tokio::time::sleep(Duration::from_millis(2)).await;
+			dropped_at_stop = client.dropped_datagrams();
+			if dropped_at_stop > 0 {
+				break;
+			}
+		}
+		let _ = stop_tx.send(());
+		(sent, dropped_at_stop)
+	};
+
+	let (received, (sent, dropped_at_stop)) = tokio::join!(reader, flood);
+	(received, sent, client.dropped_datagrams(), dropped_at_stop)
+}
+
+/// The quiche driver's inbound datagram queue is bounded.
+///
+/// `process_reads` used to drain every queued datagram into an *unbounded*
+/// channel, so a handle that stopped (or lagged in) reading `read_datagram`
+/// let peer-driven memory grow without bound — while the outbound side was
+/// already capped at 2048. The flood below therefore has to start dropping
+/// datagrams while it is still delivering them; if the queue were unbounded
+/// nothing would ever be dropped, no matter how far behind the reader is.
+#[cfg(feature = "quiche")]
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn quiche_inbound_datagram_queue_is_bounded() {
+	use wind_quic::quiche;
+
+	let (_dir, cert, key) = write_self_signed();
+	let (server_tls, client_tls, transport) = configs(&cert, &key);
+	assert!(
+		transport.enable_datagram,
+		"the transport must advertise DATAGRAM support for this test to mean anything"
+	);
+
+	let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+	let mut acceptor = quiche::bind_server(addr, &server_tls, &transport, None)
+		.await
+		.expect("bind_server");
+	let local = acceptor.local_addr();
+
+	let server_fut = async move { acceptor.accept().await.expect("server conn") };
+	let client_fut = quiche::connect(local, &client_tls, &transport);
+	let (server_conn, client_conn) = tokio::time::timeout(Duration::from_secs(10), async {
+		let (server_conn, client_conn) = tokio::join!(server_fut, client_fut);
+		(server_conn, client_conn)
+	})
+	.await
+	.expect("handshake timed out");
+	let client_conn = client_conn.expect("client connect");
+	assert!(
+		client_conn.max_datagram_size().is_some(),
+		"the client must have negotiated DATAGRAM support"
+	);
+
+	let (received, sent, dropped, dropped_at_stop) = tokio::time::timeout(
+		Duration::from_secs(60),
+		read_datagrams_during_flood(&server_conn, &client_conn),
+	)
+	.await
+	.expect("datagram flood timed out");
+
+	assert!(
+		dropped_at_stop > 0,
+		"the driver dropped nothing while the reader fell behind (sent={sent} received={received} dropped={dropped}): the \
+		 inbound datagram queue is unbounded again"
+	);
+	assert!(
+		dropped > 0,
+		"a bounded inbound queue must report its drops (sent={sent} received={received})"
+	);
+	assert!(
+		received > 0,
+		"the flood has to deliver datagrams for the drop count to mean anything (sent={sent} dropped={dropped})"
+	);
+	assert!(
+		received <= sent,
+		"a receiver can never see more datagrams than were sent (sent={sent} received={received})"
+	);
+	assert_eq!(
+		client_conn.dropped_datagrams(),
+		dropped,
+		"the drop counter must keep counting monotonically"
+	);
+
+	client_conn.close(0, b"done");
+	let _ = tokio::time::timeout(Duration::from_secs(2), client_conn.closed()).await;
+}

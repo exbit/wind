@@ -70,6 +70,13 @@ const MAX_PENDING_OUT: usize = 256 * 1024;
 /// oldest are dropped past this — bounding memory when the app queues faster
 /// than the peer drains (the command channel itself is unbounded).
 const MAX_OUT_DATAGRAMS: usize = 2048;
+/// Hard cap on queued *inbound* datagrams, the mirror of
+/// [`MAX_OUT_DATAGRAMS`]: the handle's receive channel is bounded and the
+/// driver drops the datagram that would grow it past this. The peer controls
+/// how many datagrams it sends, so without a cap a local application that
+/// stops calling `read_datagram` (e.g. a busy UDP relay) would let this queue
+/// grow for as long as the peer keeps sending.
+const MAX_IN_DATAGRAMS: usize = 2048;
 
 /// An item delivered on a stream's inbound channel: either a chunk of peer
 /// data, or `Err(code)` signaling the peer reset the stream (RESET_STREAM) so
@@ -81,7 +88,7 @@ pub(crate) type InboundItem = Result<Bytes, u64>;
 pub(crate) type CmdTx = mpsc::UnboundedSender<DriverCommand>;
 type AcceptBiTx = mpsc::UnboundedSender<(QuicheSend, QuicheRecv)>;
 type AcceptUniTx = mpsc::UnboundedSender<QuicheRecv>;
-type DgramInTx = mpsc::UnboundedSender<Bytes>;
+type DgramInTx = mpsc::Sender<Bytes>;
 /// A queued keying-material export request: `(out_len, label, context, reply)`.
 type ExportReq = (usize, Vec<u8>, Vec<u8>, oneshot::Sender<Option<Vec<u8>>>);
 
@@ -137,6 +144,10 @@ pub(crate) struct Shared {
 	/// (0 = not sent, 1 = rejected, 2 = accepted, ...). See
 	/// [`quiche::Connection::early_data_reason`].
 	pub early_data_reason: AtomicU32,
+	/// Cumulative inbound datagrams dropped because the bounded receive queue
+	/// was full. Peer-driven, so this counts loss the application never asked
+	/// for; exposed so the drop is observable instead of silent.
+	pub dropped_in_datagrams: AtomicU64,
 }
 
 /// Per-stream bridge state held by the driver.
@@ -249,6 +260,8 @@ pub(crate) struct BridgeDriver {
 	/// Whether an unsendable datagram has already been reported at `warn` for
 	/// this connection (subsequent drops stay at `trace` to avoid log spam).
 	dgram_drop_warned: bool,
+	/// Same, for inbound datagrams dropped by the receive-queue cap.
+	dgram_in_drop_warned: bool,
 	pending_opens: VecDeque<PendingOpen>,
 	pending_exports: VecDeque<ExportReq>,
 	pending_sessions: VecDeque<oneshot::Sender<Option<Vec<u8>>>>,
@@ -267,7 +280,7 @@ impl BridgeDriver {
 		let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 		let (accept_bi_tx, accept_bi_rx) = mpsc::unbounded_channel();
 		let (accept_uni_tx, accept_uni_rx) = mpsc::unbounded_channel();
-		let (dgram_in_tx, dgram_in_rx) = mpsc::unbounded_channel();
+		let (dgram_in_tx, dgram_in_rx) = mpsc::channel(MAX_IN_DATAGRAMS);
 		let shared = Arc::new(Shared {
 			max_dgram: AtomicUsize::new(0),
 			closed: AtomicBool::new(false),
@@ -275,6 +288,7 @@ impl BridgeDriver {
 			sent_bytes: AtomicU64::new(0),
 			recv_bytes: AtomicU64::new(0),
 			early_data_reason: AtomicU32::new(0),
+			dropped_in_datagrams: AtomicU64::new(0),
 		});
 		let handle = Handle::new(
 			cmd_tx.clone(),
@@ -301,6 +315,7 @@ impl BridgeDriver {
 			dgram_in_tx,
 			out_datagrams: VecDeque::new(),
 			dgram_drop_warned: false,
+			dgram_in_drop_warned: false,
 			pending_opens: VecDeque::new(),
 			pending_exports: VecDeque::new(),
 			pending_sessions: VecDeque::new(),
@@ -337,6 +352,37 @@ impl BridgeDriver {
 	fn is_peer_initiated(&self, sid: u64) -> bool {
 		let init = if self.is_server { 1 } else { 0 };
 		(sid & 1) != init
+	}
+
+	/// Queue one inbound datagram for the handle.
+	///
+	/// The receive channel is bounded ([`MAX_IN_DATAGRAMS`]), so the datagram
+	/// that would grow it past the cap is dropped. Previously the channel was
+	/// unbounded *and* [`process_reads`](ApplicationOverQuic::process_reads)
+	/// drained every queued datagram into it, so a handle that stopped reading
+	/// let peer-driven memory grow without bound. Datagrams are unreliable, so
+	/// dropping is the accepted loss mode (the outbound queue drops its oldest
+	/// past [`MAX_OUT_DATAGRAMS`] for the same reason); the counter keeps the
+	/// loss observable.
+	///
+	/// Returns `false` when the datagram was dropped because the queue was
+	/// full, so the caller can stop draining.
+	fn accept_datagram(&mut self, data: Bytes) -> bool {
+		match self.dgram_in_tx.try_send(data) {
+			Ok(()) => true,
+			Err(TrySendError::Full(_)) => {
+				self.shared.dropped_in_datagrams.fetch_add(1, Ordering::Relaxed);
+				if self.dgram_in_drop_warned {
+					trace!("dropping inbound QUIC datagram: receive queue full");
+				} else {
+					self.dgram_in_drop_warned = true;
+					warn!("dropping inbound QUIC datagrams: receive queue full; further drops at trace level");
+				}
+				false
+			}
+			// The handle is gone (connection teardown); nothing to deliver to.
+			Err(TrySendError::Closed(_)) => false,
+		}
 	}
 
 	fn open_local_bi(&mut self) -> (QuicheSend, QuicheRecv) {
@@ -714,7 +760,14 @@ impl ApplicationOverQuic for BridgeDriver {
 		loop {
 			match qconn.dgram_recv(&mut self.buffer) {
 				Ok(n) => {
-					let _ = self.dgram_in_tx.send(Bytes::copy_from_slice(&self.buffer[..n]));
+					// Bounded queue: the datagram that would overflow it is
+					// dropped and the drain stops. Datagrams left unread stay
+					// in quiche's own receive queue, so a handle that stops
+					// reading no longer lets this path accumulate without
+					// bound.
+					if !self.accept_datagram(Bytes::copy_from_slice(&self.buffer[..n])) {
+						break;
+					}
 				}
 				Err(quiche::Error::Done) => break,
 				Err(e) => {
