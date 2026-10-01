@@ -219,7 +219,7 @@ impl<R: Router> App<R> {
 		}
 
 		// Periodic traffic flush (drains the collector → sink, restore on
-		// error, final flush on shutdown).
+		// error, retried final flush on shutdown).
 		if let (Some(stats), Some(sink)) = (stats.clone(), traffic_sink.clone()) {
 			let token = ctx.token.clone();
 			let interval = flush_interval;
@@ -228,9 +228,11 @@ impl<R: Router> App<R> {
 				tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 				loop {
 					tokio::select! {
-						_ = tick.tick() => flush_once(sink.as_ref(), &stats).await,
-						_ = token.cancelled() => {
+						_ = tick.tick() => {
 							flush_once(sink.as_ref(), &stats).await;
+						}
+						_ = token.cancelled() => {
+							flush_final(sink.as_ref(), &stats).await;
 							break;
 						}
 					}
@@ -269,11 +271,35 @@ impl<R: Router> App<R> {
 	}
 }
 
+/// Attempts for the shutdown flush. The periodic flush can hand a rejected
+/// batch to the next cycle; the shutdown flush has no later cycle, so it
+/// retries in place instead of restoring into a collector that is about to be
+/// dropped.
+const FINAL_FLUSH_ATTEMPTS: u32 = 3;
+
+/// Backoff between shutdown-flush attempts (bounded: at most
+/// `FINAL_FLUSH_ATTEMPTS - 1` of these delay process exit).
+const FINAL_FLUSH_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// What one flush pass did with the drained batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlushOutcome {
+	/// Nothing was pending, so nothing was submitted.
+	Idle,
+	/// The sink accepted the batch.
+	Delivered,
+	/// The sink rejected the batch; it was restored into the collector.
+	Restored,
+}
+
 /// Drain the collector once and submit; restore the batch if the sink fails.
-async fn flush_once(sink: &dyn TrafficSink, stats: &StatsCollector) {
+///
+/// A restored batch rolls into the next flush cycle, which is why the periodic
+/// flush gets a single attempt per tick.
+async fn flush_once(sink: &dyn TrafficSink, stats: &StatsCollector) -> FlushOutcome {
 	let batch = stats.reset_all();
 	if batch.is_empty() {
-		return;
+		return FlushOutcome::Idle;
 	}
 
 	let user_count = batch.len();
@@ -290,6 +316,8 @@ async fn flush_once(sink: &dyn TrafficSink, stats: &StatsCollector) {
 			total_requests
 		);
 		stats.restore(&batch);
+
+		FlushOutcome::Restored
 	} else {
 		info!(
 			"traffic reported: {} user(s), {}↑, {}↓, {} reqs",
@@ -298,6 +326,40 @@ async fn flush_once(sink: &dyn TrafficSink, stats: &StatsCollector) {
 			ByteSize::b(total_download).display().si(),
 			total_requests
 		);
+
+		FlushOutcome::Delivered
+	}
+}
+
+/// The last flush before the runtime drops the collector.
+///
+/// Nothing submits a restored batch again once this returns, so a rejected
+/// batch is retried in place. If every attempt fails the batch stays in the
+/// collector — an externally shared one (`App::set_stats_collector`) keeps
+/// reporting those counters — but it is reported as an error, because the sink
+/// will never receive it.
+async fn flush_final(sink: &dyn TrafficSink, stats: &StatsCollector) {
+	for attempt in 1..=FINAL_FLUSH_ATTEMPTS {
+		match flush_once(sink, stats).await {
+			FlushOutcome::Idle | FlushOutcome::Delivered => return,
+			FlushOutcome::Restored => {
+				if attempt == FINAL_FLUSH_ATTEMPTS {
+					error!(
+						"final traffic flush failed after {FINAL_FLUSH_ATTEMPTS} attempts; the batch stays in a collector \
+						 that nothing flushes again, so {} user(s) of traffic never reach the sink",
+						stats.user_count()
+					);
+
+					return;
+				}
+
+				warn!(
+					"final traffic flush attempt {attempt}/{FINAL_FLUSH_ATTEMPTS} failed; retrying in \
+					 {FINAL_FLUSH_RETRY_DELAY:?}"
+				);
+				tokio::time::sleep(FINAL_FLUSH_RETRY_DELAY).await;
+			}
+		}
 	}
 }
 
@@ -306,7 +368,7 @@ mod tests {
 	use std::{
 		sync::{
 			Arc, Mutex,
-			atomic::{AtomicBool, Ordering},
+			atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 		},
 		time::Duration,
 	};
@@ -314,7 +376,7 @@ mod tests {
 	use async_trait::async_trait;
 
 	use super::*;
-	use crate::{FlowContext, RouteAction};
+	use crate::{FlowContext, RouteAction, UserId, UserTraffic};
 
 	/// Minimal router for unit tests — rejects everything.
 	struct StubRouter;
@@ -322,6 +384,54 @@ mod tests {
 	impl Router for StubRouter {
 		async fn route(&self, _ctx: &FlowContext) -> eyre::Result<RouteAction> {
 			Ok(RouteAction::Reject("unit test".into()))
+		}
+	}
+
+	/// Traffic sink that rejects the next `remaining_failures` submits, then
+	/// accepts and records what it received.
+	struct FlakySink {
+		remaining_failures: AtomicUsize,
+		attempts: AtomicUsize,
+		delivered_upload: AtomicU64,
+	}
+
+	impl FlakySink {
+		/// A sink that rejects every submit.
+		fn always_failing() -> Self {
+			Self::failing(usize::MAX)
+		}
+
+		fn failing(remaining_failures: usize) -> Self {
+			Self {
+				remaining_failures: AtomicUsize::new(remaining_failures),
+				attempts: AtomicUsize::new(0),
+				delivered_upload: AtomicU64::new(0),
+			}
+		}
+
+		fn attempts(&self) -> usize {
+			self.attempts.load(Ordering::SeqCst)
+		}
+
+		fn delivered_upload(&self) -> u64 {
+			self.delivered_upload.load(Ordering::SeqCst)
+		}
+	}
+
+	#[async_trait]
+	impl TrafficSink for FlakySink {
+		async fn submit(&self, batch: Vec<UserTraffic>) -> eyre::Result<()> {
+			self.attempts.fetch_add(1, Ordering::SeqCst);
+			if self.remaining_failures.load(Ordering::SeqCst) > 0 {
+				self.remaining_failures.fetch_sub(1, Ordering::SeqCst);
+
+				return Err(eyre::eyre!("sink unavailable"));
+			}
+
+			self.delivered_upload
+				.fetch_add(batch.iter().map(|t| t.upload).sum::<u64>(), Ordering::SeqCst);
+
+			Ok(())
 		}
 	}
 
@@ -446,5 +556,79 @@ mod tests {
 			"the shutdown timeout is an upper bound, not a fixed wait: {:?}",
 			started_at.elapsed()
 		);
+	}
+
+	/// An app whose traffic is collected into `stats` and reported to `sink`,
+	/// with the periodic flush pushed far out so only the shutdown flush runs.
+	fn app_with_traffic(stats: Arc<StatsCollector>, sink: Arc<FlakySink>) -> App<StubRouter> {
+		App::new()
+			.set_router(StubRouter)
+			.set_stats_collector(stats)
+			.set_traffic_sink(sink)
+			.set_flush_interval(Duration::from_secs(3600))
+	}
+
+	/// The periodic flush can let the next tick pick the batch up, so it stays
+	/// single-attempt per tick.
+	#[tokio::test]
+	async fn periodic_flush_leaves_a_rejected_batch_for_the_next_cycle() {
+		let sink = Arc::new(FlakySink::always_failing());
+		let stats = StatsCollector::new();
+		stats.record_upload(&UserId::from("alice"), 4096);
+
+		assert_eq!(flush_once(sink.as_ref(), &stats).await, FlushOutcome::Restored);
+		assert_eq!(sink.attempts(), 1, "the periodic flush must not retry in place");
+		assert_eq!(
+			stats
+				.snapshot_user(&UserId::from("alice"))
+				.expect("a rejected batch must be restored")
+				.upload,
+			4096,
+			"a rejected batch must roll into the next cycle intact"
+		);
+	}
+
+	/// The shutdown flush has no later cycle to retry a restored batch in, so
+	/// it must retry in place instead of handing the batch to a dying
+	/// collector.
+	#[tokio::test]
+	async fn final_flush_retries_a_transient_sink_failure() {
+		let sink = Arc::new(FlakySink::failing(1));
+		let stats = Arc::new(StatsCollector::new());
+		stats.record_upload(&UserId::from("alice"), 4096);
+
+		let _hooks = run_and_capture_hooks(app_with_traffic(stats.clone(), sink.clone())).await;
+
+		assert_eq!(
+			sink.delivered_upload(),
+			4096,
+			"the shutdown flush must retry a rejected batch in place: {} attempt(s)",
+			sink.attempts()
+		);
+		assert_eq!(sink.attempts(), 2);
+		assert!(
+			stats.snapshot().is_empty(),
+			"a delivered batch must not stay in the collector"
+		);
+	}
+
+	/// When every shutdown attempt fails the batch cannot be delivered, but it
+	/// must stay readable on a shared collector and must not be counted twice.
+	#[tokio::test]
+	async fn final_flush_restores_an_undeliverable_batch_exactly_once() {
+		let sink = Arc::new(FlakySink::always_failing());
+		let stats = Arc::new(StatsCollector::new());
+		stats.record_upload(&UserId::from("alice"), 4096);
+
+		let _hooks = run_and_capture_hooks(app_with_traffic(stats.clone(), sink.clone())).await;
+
+		assert!(
+			sink.attempts() >= 2,
+			"the shutdown flush must retry before declaring the batch lost"
+		);
+		assert_eq!(sink.delivered_upload(), 0);
+		let batch = stats.snapshot();
+		assert_eq!(batch.len(), 1, "the undeliverable batch must stay readable");
+		assert_eq!(batch[0].upload, 4096, "retrying must not double count the restored batch");
 	}
 }

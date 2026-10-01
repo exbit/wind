@@ -177,8 +177,9 @@ pub trait ConnectionHooks: Send + Sync + 'static {
 /// Receives periodic batches of per-user traffic from the flush task.
 #[async_trait]
 pub trait TrafficSink: Send + Sync + 'static {
-	/// Submit one flush cycle's batch. On `Err`, the collector `restore`s the
-	/// batch so it rolls into the next cycle (zero loss).
+	/// Submit one flush cycle's batch. On `Err`, the flush task `restore`s the
+	/// batch: the periodic flush rolls it into the next cycle, and the final
+	/// shutdown flush retries it in place, since no later cycle will run.
 	async fn submit(&self, batch: Vec<UserTraffic>) -> eyre::Result<()>;
 }
 
