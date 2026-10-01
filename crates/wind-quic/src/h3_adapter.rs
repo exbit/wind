@@ -376,9 +376,14 @@ impl<C: QuicConnection> Connection<Bytes> for H3Conn<C> {
 }
 
 fn stream_id(id: u64) -> StreamId {
-	// QUIC stream ids fit the h3 `StreamId` invariant (< 2^62); fall back to 0
-	// only if a backend ever surfaces something out of range.
-	StreamId::try_from(id).unwrap_or_else(|_| StreamId::try_from(0).expect("0 is a valid stream id"))
+	// QUIC encodes stream ids as varints, so both backends only ever surface
+	// ids that satisfy the h3 `StreamId` invariant (< 2^62) and this conversion
+	// cannot fail. Should one ever report something larger, substituting 0
+	// would hand h3 the id of the peer's *first bidi request stream* — a
+	// plausible, valid id that h3 then records in its `ongoing_streams` set and
+	// in the resolved request — so the wrong stream would be described silently
+	// instead of loudly. Fail instead, as `h3-quinn` does.
+	StreamId::try_from(id).unwrap_or_else(|_| panic!("backend stream id {id:#x} does not fit the h3 stream id range"))
 }
 
 fn poll_open_send<C: QuicConnection>(
@@ -589,5 +594,25 @@ mod tests {
 
 		assert!(matches!(poll_finish(&mut send), Poll::Ready(Ok(()))));
 		assert_eq!(finishes.load(Ordering::SeqCst), 1, "the FIN must reach the backend");
+	}
+
+	/// The positive control for the test below: every id a QUIC varint can
+	/// carry — including 0, the peer's first bidi request stream, and the
+	/// largest encodable id — is reported to h3 unchanged.
+	#[test]
+	fn in_range_backend_stream_ids_are_reported_unchanged() {
+		for id in [0, 4, 8, u32::MAX as u64, (1u64 << 62) - 1] {
+			assert_eq!(stream_id(id).into_inner(), id, "stream id {id} must survive the conversion");
+		}
+	}
+
+	/// An id a QUIC varint cannot encode is not a stream at all. Reporting it
+	/// as 0 would hand h3 the id of the peer's *first bidi request stream* — an
+	/// id it records in `ongoing_streams` and in the resolved request — so the
+	/// adapter must fail loudly instead of describing the wrong stream.
+	#[test]
+	#[should_panic(expected = "does not fit the h3 stream id range")]
+	fn an_out_of_range_backend_stream_id_is_not_reported_as_stream_zero() {
+		let _ = stream_id(1u64 << 62);
 	}
 }
