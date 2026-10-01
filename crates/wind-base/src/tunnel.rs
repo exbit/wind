@@ -35,6 +35,13 @@ fn next_assoc_id() -> u16 {
 	0x8000 | (NEXT_ASSOC_ID.fetch_add(1, Ordering::Relaxed) & 0x7fff)
 }
 
+/// Smallest idle timeout accepted by [`TunnelUdpInbound::new`].
+///
+/// Session GC runs at `timeout / 4`, and `tokio::time::interval` panics on a
+/// zero period. `Duration` division truncates, so 3 ns / 4 already rounds the
+/// tick down to zero — the guard has to cover that, not only exactly zero.
+const MIN_UDP_TUNNEL_TIMEOUT: std::time::Duration = std::time::Duration::from_nanos(4);
+
 // ── TCP tunnel ─────────────────────────────────────────────────────────────
 
 /// TCP port forwarder as a wind-core inbound.
@@ -131,12 +138,28 @@ pub struct TunnelUdpInbound {
 }
 
 impl TunnelUdpInbound {
+	/// Bind the UDP tunnel socket.
+	///
+	/// `timeout` is the per-source idle timeout; it must be at least
+	/// [`MIN_UDP_TUNNEL_TIMEOUT`] so that the session GC period `timeout / 4`
+	/// stays representable as a non-zero [`std::time::Duration`]. Anything
+	/// smaller is rejected with [`std::io::ErrorKind::InvalidInput`] instead of
+	/// panicking later inside `tokio::time::interval`.
 	pub fn new(
 		listen: SocketAddr,
 		remote: (String, u16),
 		timeout: std::time::Duration,
 		cancel: CancellationToken,
 	) -> std::io::Result<Self> {
+		if timeout < MIN_UDP_TUNNEL_TIMEOUT {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::InvalidInput,
+				format!(
+					"tunnel UDP idle timeout must be at least {MIN_UDP_TUNNEL_TIMEOUT:?} so the GC tick is non-zero, got \
+					 {timeout:?}"
+				),
+			));
+		}
 		let socket = std::net::UdpSocket::bind(listen)?;
 		socket.set_nonblocking(true)?;
 		let socket = UdpSocket::from_std(socket)?;
@@ -604,6 +627,35 @@ mod tests {
 			.expect("timed out")
 			.expect("join error")
 			.expect("listen returned error");
+	}
+
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn udp_tunnel_rejects_idle_timeouts_that_would_zero_the_gc_tick() {
+		let cancel = CancellationToken::new();
+		let err = match TunnelUdpInbound::new(free_udp_addr(), ("zero.test".into(), 53), Duration::ZERO, cancel.clone()) {
+			Ok(_) => panic!("a zero idle timeout must be rejected, not accepted and then panicked on"),
+			Err(err) => err,
+		};
+		assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+		// `Duration` division truncates, so 3 ns / 4 == 0: the guard has to
+		// cover sub-nanosecond-tick periods, not only exactly zero.
+		let err = match TunnelUdpInbound::new(
+			free_udp_addr(),
+			("tiny.test".into(), 53),
+			Duration::from_nanos(3),
+			cancel.clone(),
+		) {
+			Ok(_) => panic!("3 ns / 4 == 0 would panic the GC tick"),
+			Err(err) => err,
+		};
+		assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+		// The smallest accepted timeout still yields a non-zero GC tick.
+		assert!(
+			TunnelUdpInbound::new(free_udp_addr(), ("tiny.test".into(), 53), Duration::from_nanos(4), cancel).is_ok(),
+			"4 ns / 4 == 1 ns is a valid GC tick"
+		);
 	}
 
 	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
