@@ -8,7 +8,7 @@ use hickory_resolver::{
 };
 use wind_core::{
 	StackPrefer,
-	resolve::{Resolver, filter_addrs_by_preference, pick_addr_by_preference},
+	resolve::{Resolver, bail_if_no_addrs, filter_addrs_by_preference, pick_addr_by_preference},
 };
 
 use crate::config::{DnsConfig, DnsMode};
@@ -59,7 +59,9 @@ impl Resolver for HickoryResolver {
 			if addrs.is_empty() {
 				eyre::bail!("no DNS records for {host}");
 			}
-			Ok(filter_addrs_by_preference(addrs, self.prefer))
+			let addrs = filter_addrs_by_preference(addrs, self.prefer);
+			bail_if_no_addrs(&addrs, host, self.prefer)?;
+			Ok(addrs)
 		})
 	}
 }
@@ -214,6 +216,7 @@ mod tests {
 	use std::net::{Ipv4Addr, Ipv6Addr};
 
 	use hickory_resolver::config::ProtocolConfig;
+	use wind_core::resolve::filter_addrs_by_preference;
 
 	use super::*;
 
@@ -312,5 +315,21 @@ mod tests {
 		};
 		let result = build(&cfg).unwrap();
 		assert!(result.is_none());
+	}
+
+	#[tokio::test]
+	async fn resolve_all_errors_when_the_preference_filter_empties_the_list() {
+		// Regression W53: `HickoryResolver::resolve_all` returned
+		// `Ok(filter_addrs_by_preference(..))` as-is, so a host that only
+		// resolved to the other family produced `Ok(vec![])` —
+		// indistinguishable from a successful lookup with no addresses.
+		let v4_only: Vec<IpAddr> = vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))];
+		let filtered = filter_addrs_by_preference(v4_only, StackPrefer::V6only);
+		assert!(filtered.is_empty());
+		let err = bail_if_no_addrs(&filtered, "example.com", StackPrefer::V6only).unwrap_err();
+		assert!(
+			err.to_string().contains("no address matching V6only"),
+			"unexpected message: {err}"
+		);
 	}
 }
