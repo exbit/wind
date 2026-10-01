@@ -908,10 +908,24 @@ async fn handle_datagram<C: QuicConnection, CB: InboundCallback + Clone>(
 
 /// Validate one `Authenticate` command.
 ///
-/// Enforces the per-connection attempt budget ([`MAX_AUTH_ATTEMPTS`]) and
+/// Refuses an `Authenticate` on a connection that already authenticated,
+/// enforces the per-connection attempt budget ([`MAX_AUTH_ATTEMPTS`]) and
 /// terminates the connection on any failure (SPEC §5.1.3, §7.5, §9.1). All
 /// errors are deliberately generic: they never reveal whether the UUID exists.
 async fn handle_auth<C: QuicConnection>(connection: &InboundCtx<C>, uuid: Uuid, token: [u8; 32]) -> eyre::Result<()> {
+	// A TUIC client authenticates exactly once per QUIC connection, so a second
+	// `Authenticate` is a protocol violation. The attempt budget below already
+	// refuses it in practice, but that budget is a rate limit that may be
+	// retuned; this guard states the invariant directly so a duplicate attempt
+	// can never re-enter the connection-management hook (`on_authenticated`),
+	// re-run the credential lookup, or republish the identity, whatever the
+	// budget is set to. Checked before the budget so a duplicate is refused
+	// without consuming it.
+	if connection.auth.load().is_some() {
+		connection.close_auth_failed(b"already authenticated");
+		return Err(eyre::eyre!("already authenticated"));
+	}
+
 	// Rate limiting (SPEC §9.1): only the first `Authenticate` on a connection
 	// may reach the credential lookup and the keying-material export. Refuse
 	// anything beyond it — and terminate the connection — without doing that
@@ -1328,7 +1342,7 @@ mod tests {
 	use bytes::Bytes;
 	use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 	use uuid::Uuid;
-	use wind_core::{InboundCallback, TuicAuthenticator, UserId, udp::UdpStream as CoreUdpStream};
+	use wind_core::{ConnectionHooks, InboundCallback, TuicAuthenticator, UserId, udp::UdpStream as CoreUdpStream};
 	use wind_quic::{QuicRecvStream, QuicSendStream};
 
 	// Brings in Arc, Duration, Ordering, CancellationToken, QuicError, CmdType,
@@ -1975,6 +1989,18 @@ mod tests {
 		Arc::new(unauthenticated_test_ctx(conn, auth))
 	}
 
+	/// The same context as [`auth_test_ctx`], additionally wired to the
+	/// connection-management `connection` hooks.
+	fn auth_test_ctx_with_hooks(
+		conn: DummyConn,
+		auth: Arc<dyn TuicAuthenticator>,
+		connection: Arc<dyn ConnectionHooks>,
+	) -> InboundCtx<DummyConn> {
+		let mut ctx = unauthenticated_test_ctx(conn, auth);
+		ctx.hooks.connection = Some(connection);
+		ctx
+	}
+
 	/// The same context as [`auth_test_ctx`], but unwrapped so a test can seed
 	/// the auth state before sharing it.
 	fn unauthenticated_test_ctx(conn: DummyConn, auth: Arc<dyn TuicAuthenticator>) -> InboundCtx<DummyConn> {
@@ -2122,6 +2148,159 @@ mod tests {
 		let closes = obs.closes.lock().expect("close recorder poisoned");
 		assert_eq!(closes.len(), 1, "the connection must be closed exactly once");
 		assert_eq!(closes[0], (0, b"auth failed".to_vec()));
+	}
+
+	/// [`ConnectionHooks`] implementation that counts the lifecycle callbacks
+	/// the server makes, so a test can pin how often the `on_authenticated`
+	/// connection-management veto is asked.
+	struct CountingConnectionHooks {
+		authenticated: AtomicUsize,
+	}
+
+	#[async_trait::async_trait]
+	impl ConnectionHooks for CountingConnectionHooks {
+		async fn on_authenticated(&self, _info: &ConnInfo, _user: &UserId) -> ConnectDecision {
+			self.authenticated.fetch_add(1, Ordering::SeqCst);
+			ConnectDecision::Accept
+		}
+	}
+
+	/// W44: a repeated `Authenticate` on an already-authenticated connection
+	/// must not re-enter the connection-management hook (`on_authenticated`),
+	/// re-run the credential lookup, or republish the identity. The
+	/// per-connection attempt budget already refuses it in practice; this
+	/// drives the guard that states the invariant independently of that
+	/// budget.
+	#[tokio::test]
+	async fn auth_on_an_already_authenticated_connection_is_refused() {
+		let (conn, obs) = DummyConn::observed();
+		let uuid = Uuid::new_v4();
+		let auth = Arc::new(CountingAuth {
+			known: Some(uuid),
+			password: Arc::from(&b"pw"[..]),
+			lookups: AtomicUsize::new(0),
+		});
+		let hooks = Arc::new(CountingConnectionHooks {
+			authenticated: AtomicUsize::new(0),
+		});
+		let ctx = auth_test_ctx_with_hooks(conn, auth.clone(), hooks.clone());
+
+		// First attempt: `DummyConn::observed` exports a fixed `0xAB` token.
+		handle_auth(&ctx, uuid, [0xAB; 32])
+			.await
+			.expect("the token must match the mock exporter");
+		assert_eq!(
+			hooks.authenticated.load(Ordering::SeqCst),
+			1,
+			"auth publishes the identity once"
+		);
+		let published = ctx.user().expect("a successful auth publishes the identity");
+
+		// Same credentials again on the same connection: the identity is
+		// already published, so this must not authenticate a second
+		// time.
+		let err = handle_auth(&ctx, uuid, [0xAB; 32])
+			.await
+			.expect_err("a repeated Authenticate must be refused");
+		assert_eq!(err.to_string(), "already authenticated");
+		assert_eq!(
+			auth.lookups.load(Ordering::SeqCst),
+			1,
+			"a repeated Authenticate must not reach the authenticator again"
+		);
+		assert_eq!(
+			obs.exports.load(Ordering::SeqCst),
+			1,
+			"a repeated Authenticate must not run another keying-material export"
+		);
+		assert_eq!(
+			hooks.authenticated.load(Ordering::SeqCst),
+			1,
+			"on_authenticated must not fire twice for one connection"
+		);
+		assert_eq!(ctx.user(), Some(published), "the published identity must not change");
+
+		let closes = obs.closes.lock().expect("close recorder poisoned");
+		assert_eq!(closes.len(), 1, "the repeated attempt terminates the connection");
+		assert_eq!(closes[0], (0, b"already authenticated".to_vec()));
+	}
+
+	/// W44: the explicit guard is not the only barrier. Two `Authenticate`
+	/// commands that both reach `handle_auth` before either publishes an
+	/// identity — the concurrent case the guard alone cannot close — must still
+	/// yield exactly one authentication: the atomic attempt claim refuses the
+	/// second one before any credential work and before the hook.
+	#[tokio::test]
+	async fn concurrent_duplicate_auth_commands_authenticate_exactly_once() {
+		let (conn, obs) = DummyConn::observed();
+		let uuid = Uuid::new_v4();
+		let auth = Arc::new(CountingAuth {
+			known: Some(uuid),
+			password: Arc::from(&b"pw"[..]),
+			lookups: AtomicUsize::new(0),
+		});
+		let hooks = Arc::new(CountingConnectionHooks {
+			authenticated: AtomicUsize::new(0),
+		});
+		// `InboundCtx` is not `Clone`; both attempts share one connection the
+		// same way the acceptors hand an `Arc<InboundCtx>` to each stream task.
+		let ctx = Arc::new(auth_test_ctx_with_hooks(conn, auth.clone(), hooks.clone()));
+
+		let first = {
+			let ctx = ctx.clone();
+			tokio::spawn(async move { handle_auth(&ctx, uuid, [0xAB; 32]).await })
+		};
+		let second = {
+			let ctx = ctx.clone();
+			tokio::spawn(async move { handle_auth(&ctx, uuid, [0xAB; 32]).await })
+		};
+		let mut results = Vec::new();
+		for task in [first, second] {
+			results.push(
+				tokio::time::timeout(Duration::from_secs(5), task)
+					.await
+					.expect("a concurrent Auth attempt must not hang")
+					.expect("a concurrent Auth attempt must not panic"),
+			);
+		}
+
+		assert_eq!(
+			results.iter().filter(|r| r.is_ok()).count(),
+			1,
+			"exactly one attempt may succeed"
+		);
+		let refused = results
+			.iter()
+			.filter_map(|r| r.as_ref().err())
+			.next()
+			.expect("the other attempt must be refused");
+		assert!(
+			matches!(
+				refused.to_string().as_str(),
+				"too many authentication attempts" | "already authenticated"
+			),
+			"unexpected refusal: {refused}"
+		);
+		assert_eq!(
+			auth.lookups.load(Ordering::SeqCst),
+			1,
+			"only one attempt may reach the authenticator"
+		);
+		assert_eq!(
+			obs.exports.load(Ordering::SeqCst),
+			1,
+			"only one attempt may run the keying-material export"
+		);
+		assert_eq!(
+			hooks.authenticated.load(Ordering::SeqCst),
+			1,
+			"on_authenticated must fire exactly once for one connection"
+		);
+		assert!(ctx.auth.load().is_some(), "the winning attempt publishes the identity");
+
+		let closes = obs.closes.lock().expect("close recorder poisoned");
+		assert_eq!(closes.len(), 1, "the refused attempt terminates the connection");
+		assert_eq!(closes[0].0, 0);
 	}
 
 	/// A correct token must still authenticate on its first attempt and must
