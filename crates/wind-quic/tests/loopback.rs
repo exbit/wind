@@ -479,3 +479,142 @@ async fn quiche_connects_to_ipv6_peer() {
 	client_conn.close(0, b"done");
 	let _ = tokio::time::timeout(Duration::from_secs(2), client_conn.closed()).await;
 }
+
+/// Echo `payload` over a fresh bidi stream, asserting the byte-for-byte
+/// round trip on both ends. Used by the address-family tests below.
+async fn echo_once<C: QuicConnection>(server: &C, client: &C) {
+	const PAYLOAD: &[u8] = b"family-probe";
+
+	let server_side = async {
+		let (mut s_send, mut s_recv) = server.accept_bi().await.expect("accept_bi");
+		let mut buf = vec![0u8; PAYLOAD.len()];
+		s_recv.read_exact(&mut buf).await.expect("server read probe");
+		assert_eq!(buf.as_slice(), PAYLOAD);
+		s_send.write_all(&buf).await.expect("server write echo");
+		s_send.finish().expect("server finish");
+	};
+	let client_side = async {
+		let (mut c_send, mut c_recv) = client.open_bi().await.expect("open_bi");
+		c_send.write_all(PAYLOAD).await.expect("client write probe");
+		c_send.finish().expect("client finish");
+		let mut echo = vec![0u8; PAYLOAD.len()];
+		c_recv.read_exact(&mut echo).await.expect("client read echo");
+		assert_eq!(echo.as_slice(), PAYLOAD, "echo round-trip");
+	};
+	let (server_res, client_res) = tokio::join!(server_side, client_side);
+	assert_eq!(server_res, ());
+	assert_eq!(client_res, ());
+}
+
+/// Whether this host has an IPv6 loopback interface.
+///
+/// A host without one cannot run the address-family tests; that is not their
+/// subject, so they report a skip rather than failing.
+async fn has_ipv6_loopback() -> bool {
+	tokio::net::UdpSocket::bind("[::1]:0").await.is_ok()
+}
+
+/// The quinn client must bind its local UDP socket on the peer's address
+/// family. It used to always bind `0.0.0.0:0`, so dialing an IPv6 peer failed
+/// with an address-family mismatch before the handshake could start.
+#[cfg(feature = "quinn")]
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn quinn_connects_to_ipv6_peer() {
+	use wind_quic::quinn;
+
+	if !has_ipv6_loopback().await {
+		eprintln!("skipping quinn_connects_to_ipv6_peer: no IPv6 loopback on this host");
+		return;
+	}
+
+	let (_dir, cert, key) = write_self_signed();
+	let (server_tls, client_tls, transport) = configs(&cert, &key);
+
+	let addr: SocketAddr = "[::1]:0".parse().unwrap();
+	let acceptor = quinn::bind_server(addr, &server_tls, &transport).expect("bind_server on [::1]");
+	let local = acceptor.local_addr().expect("local_addr");
+	assert!(local.is_ipv6(), "server must be bound on IPv6: {local}");
+
+	// Drive both sides concurrently and bound the whole exchange: a mismatched
+	// bind address family fails the dial outright, and the acceptor would then
+	// wait forever for a connection that can never arrive.
+	let server_fut = async move { acceptor.accept().await.expect("incoming").expect("server conn") };
+	let client_fut = quinn::connect(local, &client_tls, &transport);
+	let (server_conn, client_conn) = tokio::time::timeout(Duration::from_secs(10), async {
+		let (server_conn, client_conn) = tokio::join!(server_fut, client_fut);
+		(server_conn, client_conn)
+	})
+	.await
+	.expect("IPv6 handshake timed out");
+	let client_conn = client_conn.expect("client connect to an IPv6 peer");
+
+	echo_once(&server_conn, &client_conn).await;
+
+	client_conn.close(0, b"done");
+	let _ = tokio::time::timeout(Duration::from_secs(2), client_conn.closed()).await;
+}
+
+/// [`wind_quic::quinn::QuinnClient`] builds one long-lived endpoint up front,
+/// so it cannot infer the peer's family the way [`wind_quic::quinn::connect`]
+/// does. It must therefore expose an explicit local bind address; the default
+/// stays IPv4 so existing callers keep their behavior.
+#[cfg(feature = "quinn")]
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn quinn_client_binds_the_configured_address_family() {
+	use wind_quic::quinn;
+
+	if !has_ipv6_loopback().await {
+		eprintln!("skipping quinn_client_binds_the_configured_address_family: no IPv6 loopback on this host");
+		return;
+	}
+
+	// A family that does not match the peer is rejected at connect time rather
+	// than sent to the wrong socket, and the default remains IPv4.
+	let ipv4_socket: SocketAddr = "0.0.0.0:0".parse().unwrap();
+	assert_eq!(quinn::client_bind_addr("127.0.0.1:1".parse().unwrap()), ipv4_socket);
+	assert_eq!(
+		quinn::client_bind_addr("[::1]:1".parse().unwrap()),
+		"[::]:0".parse::<SocketAddr>().unwrap()
+	);
+
+	let (_dir, cert, key) = write_self_signed();
+	let (server_tls, client_tls, transport) = configs(&cert, &key);
+
+	let ipv4_client = quinn::QuinnClient::new(&client_tls, &transport)
+		.await
+		.expect("default client");
+	let ipv4_local = ipv4_client.local_addr().expect("local_addr");
+	assert!(
+		!ipv4_local.is_ipv6(),
+		"QuinnClient::new must keep binding an IPv4 socket: {ipv4_local}"
+	);
+	assert!(
+		ipv4_client.connecting("[::1]:1".parse().unwrap()).is_err(),
+		"a cross-family peer must be rejected instead of dialed from the wrong socket"
+	);
+	drop(ipv4_client);
+
+	// Same-family (IPv6) dial through the explicit bind address.
+	let addr: SocketAddr = "[::1]:0".parse().unwrap();
+	let acceptor = quinn::bind_server(addr, &server_tls, &transport).expect("bind_server on [::1]");
+	let local = acceptor.local_addr().expect("local_addr");
+
+	let server_fut = async move { acceptor.accept().await.expect("incoming").expect("server conn") };
+	let client_fut = async {
+		let client = quinn::QuinnClient::new_bound(&client_tls, &transport, "[::]:0".parse().unwrap())
+			.await
+			.expect("new_bound client");
+		client.connect(local).await.expect("client connect to an IPv6 peer")
+	};
+	let (server_conn, client_conn) = tokio::time::timeout(Duration::from_secs(10), async {
+		let (server_conn, client_conn) = tokio::join!(server_fut, client_fut);
+		(server_conn, client_conn)
+	})
+	.await
+	.expect("IPv6 handshake through QuinnClient timed out");
+
+	echo_once(&server_conn, &client_conn).await;
+
+	client_conn.close(0, b"done");
+	let _ = tokio::time::timeout(Duration::from_secs(2), client_conn.closed()).await;
+}

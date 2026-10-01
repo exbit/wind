@@ -10,7 +10,7 @@ mod udp;
 
 use std::{
 	io,
-	net::{Ipv4Addr, SocketAddr},
+	net::{Ipv4Addr, Ipv6Addr, SocketAddr},
 	pin::Pin,
 	sync::Arc,
 	task::{Context, Poll},
@@ -221,6 +221,23 @@ pub fn bind_server(
 	Ok(QuinnAcceptor { endpoint })
 }
 
+/// The local address a client socket binds before dialing `peer`.
+///
+/// The family must match `peer`: a socket bound to `0.0.0.0` cannot dial an
+/// IPv6 peer (and vice versa), so the dial fails before the handshake starts.
+///
+/// A single wildcard socket is *not* a portable substitute. The unspecified
+/// IPv6 address is IPv6-only on Windows — an IPv4 dial on it fails with
+/// `WSAEADDRNOTAVAIL` even when `IPV6_V6ONLY` is clear — so an endpoint meant
+/// for both families must still be rebuilt per peer family.
+pub fn client_bind_addr(peer: SocketAddr) -> SocketAddr {
+	if peer.is_ipv6() {
+		SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
+	} else {
+		SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+	}
+}
+
 /// Connect to `peer` as a client, returning an established [`QuinnConnection`].
 pub async fn connect(
 	peer: SocketAddr,
@@ -235,9 +252,11 @@ pub async fn connect(
 	));
 	client_config.transport_config(Arc::new(build_transport(transport)?));
 
-	// Bind an ephemeral local socket on the unspecified address.
-	let bind_addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0));
-	let socket = std::net::UdpSocket::bind(bind_addr).map_err(|e| QuicError::Endpoint(format!("bind client: {e}")))?;
+	// Bind an ephemeral local socket on the unspecified address that matches
+	// `peer`'s family.
+	let bind_addr = client_bind_addr(peer);
+	let socket =
+		std::net::UdpSocket::bind(bind_addr).map_err(|e| QuicError::Endpoint(format!("bind client {bind_addr}: {e}")))?;
 	let endpoint = Endpoint::new(EndpointConfig::default(), None, socket, Arc::new(TokioRuntime))
 		.map_err(|e| QuicError::Endpoint(format!("create client endpoint: {e}")))?;
 	endpoint.set_default_client_config(client_config);
@@ -263,6 +282,13 @@ pub async fn connect(
 /// config alive, so a second `connect` can resume the TLS session established
 /// by the first and replay 0-RTT early data (observable via
 /// `Connecting::into_0rtt` / `ZeroRttAccepted`).
+///
+/// The endpoint binds once, when the struct is built, so it cannot pick a
+/// socket family from the peer the way [`connect`] does. The default is
+/// `0.0.0.0:0` (IPv4-only, the historical behavior); call
+/// [`QuinnClient::with_bind_addr`] to reach IPv6 peers. See
+/// [`client_bind_addr`] for why one wildcard socket cannot serve both
+/// families.
 pub struct QuinnClient {
 	endpoint: Endpoint,
 	client_config: ClientConfig,
@@ -270,8 +296,23 @@ pub struct QuinnClient {
 }
 
 impl QuinnClient {
-	/// Create a client endpoint bound to an ephemeral local socket.
+	/// Create a client endpoint bound to an ephemeral IPv4 local socket.
 	pub async fn new(tls_cfg: &ClientTlsConfig, transport: &TransportConfig) -> Result<Self, QuicError> {
+		Self::new_bound(tls_cfg, transport, SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))).await
+	}
+
+	/// Create a client endpoint bound to an ephemeral local socket on
+	/// `bind_addr`.
+	///
+	/// Pass [`client_bind_addr`]`(peer)` to dial a specific peer, or the
+	/// unspecified address of the family you need. The address family cannot be
+	/// changed later: [`QuinnClient::connect`] fails with
+	/// [`QuicError::Endpoint`] when `peer` belongs to the other family.
+	pub async fn new_bound(
+		tls_cfg: &ClientTlsConfig,
+		transport: &TransportConfig,
+		bind_addr: SocketAddr,
+	) -> Result<Self, QuicError> {
 		tls::ensure_provider();
 		let crypto = tls::client_crypto(tls_cfg)?;
 		let mut client_config = ClientConfig::new(Arc::new(
@@ -280,8 +321,8 @@ impl QuinnClient {
 		));
 		client_config.transport_config(Arc::new(build_transport(transport)?));
 
-		let bind_addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0));
-		let socket = std::net::UdpSocket::bind(bind_addr).map_err(|e| QuicError::Endpoint(format!("bind client: {e}")))?;
+		let socket =
+			std::net::UdpSocket::bind(bind_addr).map_err(|e| QuicError::Endpoint(format!("bind client {bind_addr}: {e}")))?;
 		let endpoint = Endpoint::new(EndpointConfig::default(), None, socket, Arc::new(TokioRuntime))
 			.map_err(|e| QuicError::Endpoint(format!("create client endpoint: {e}")))?;
 
@@ -292,9 +333,24 @@ impl QuinnClient {
 		})
 	}
 
+	/// The local socket address this endpoint is bound to.
+	pub fn local_addr(&self) -> Result<SocketAddr, QuicError> {
+		self.endpoint.local_addr().map_err(|e| QuicError::Endpoint(e.to_string()))
+	}
+
 	/// Begin connecting to `peer`, returning the raw quinn `Connecting` so
 	/// callers can observe 0-RTT via `into_0rtt` / `ZeroRttAccepted`.
 	pub fn connecting(&self, peer: SocketAddr) -> Result<quinn::Connecting, QuicError> {
+		// quinn reports a cross-family dial as a generic UDP send error; name
+		// the real cause here instead.
+		if let Ok(local) = self.endpoint.local_addr()
+			&& local.is_ipv6() != peer.is_ipv6()
+		{
+			return Err(QuicError::Endpoint(format!(
+				"endpoint is bound to {local}, which cannot dial the {} peer {peer}",
+				if peer.is_ipv6() { "IPv6" } else { "IPv4" }
+			)));
+		}
 		self.endpoint
 			.connect_with(self.client_config.clone(), peer, &self.server_name)
 			.map_err(|e| QuicError::ConnectionLost(format!("connect {peer}: {e}")))
