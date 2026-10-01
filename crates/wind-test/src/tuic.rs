@@ -80,7 +80,7 @@ impl Outbound for DirectCallback {
 			.in_current_span(),
 		);
 
-		tokio::spawn(
+		let reply_handle = tokio::spawn(
 			async move {
 				let mut buf = vec![0u8; 65536];
 				loop {
@@ -119,8 +119,31 @@ impl Outbound for DirectCallback {
 			.in_current_span(),
 		);
 
-		recv_handle.await?;
-		Ok(())
+		// Both halves are joined: the reply relay must not outlive this call.
+		// It owns the only `tx` clone, so a task left running keeps the
+		// local receive side open indefinitely while it sits parked in
+		// `recv_from`. Dropping a `JoinHandle` only detaches, so the
+		// survivor has to be aborted explicitly — that drops the task
+		// (and its `tx`) before this function returns.
+		let mut upstream = std::pin::pin!(recv_handle);
+		let mut reply_handle = reply_handle;
+		let (upstream_join, reply_join): (Result<(), tokio::task::JoinError>, Option<Result<(), tokio::task::JoinError>>) = tokio::select! {
+			result = &mut upstream => (result, None),
+			result = &mut reply_handle => (Ok(()), Some(result)),
+		};
+		upstream.abort();
+		reply_handle.abort();
+		if let Some(Err(e)) = reply_join
+			&& !e.is_cancelled()
+		{
+			return Err(eyre::Report::msg(format!("DirectCallback UDP reply task join failed: {e}")));
+		}
+		// `upstream` is the task whose completion ended the association, so a
+		// join error here is a real failure rather than our own cancellation.
+		match upstream_join {
+			Ok(()) => Ok(()),
+			Err(e) => Err(eyre::Report::msg(format!("DirectCallback UDP receive task join failed: {e}"))),
+		}
 	}
 }
 
@@ -447,6 +470,76 @@ mod tests {
 			client.udp_session.entry_count(),
 			0,
 			"UDP session cache entries leaked after all local streams closed"
+		);
+	}
+
+	/// The reply relay task must not outlive `handle_udp`: it holds the only
+	/// `tx` clone, so a task left running keeps the local receive side open
+	/// after the association has been torn down. The regression harness
+	/// observed the upstream channel still open 3 s after `handle_udp`
+	/// returned; here that shows up as a receive that never resolves to `None`.
+	#[tokio::test]
+	async fn direct_callback_udp_reply_task_does_not_outlive_handle_udp() {
+		// A locally bound UDP socket stands in for the real echo target and
+		// makes the relay receive at least one datagram before parking.
+		let echo = UdpSocket::bind("127.0.0.1:0").await.expect("bind local udp echo");
+		let echo_addr = echo.local_addr().expect("echo local addr");
+		tokio::spawn(
+			async move {
+				let mut buf = vec![0u8; 2048];
+				while let Ok((n, from)) = echo.recv_from(&mut buf).await {
+					let _ = echo.send_to(&buf[..n], from).await;
+				}
+			}
+			.in_current_span(),
+		);
+
+		let (tx_to_relay, rx_at_relay) = tokio::sync::mpsc::channel::<UdpPacket>(4);
+		let (tx_to_caller, mut rx_at_caller) = tokio::sync::mpsc::channel::<UdpPacket>(4);
+		let stream = UdpStream {
+			tx: tx_to_caller,
+			rx: rx_at_relay,
+		};
+		let target = TargetAddr::IPv4(std::net::Ipv4Addr::LOCALHOST, echo_addr.port());
+
+		let handle = tokio::spawn(async move { DirectCallback.handle_udp(test_udp_ctx(), stream).await });
+
+		// One datagram out, its echo back: this puts the reply relay task on
+		// the relay socket, exactly the state the leak needs. The echo
+		// also proves the relay path ran, so parking in `recv_from`
+		// afterwards is real.
+		tx_to_relay
+			.send(UdpPacket {
+				source: None,
+				target,
+				payload: Bytes::from_static(b"wind-test direct callback udp"),
+			})
+			.await
+			.expect("send packet into the direct callback");
+		let echoed = tokio::time::timeout(Duration::from_secs(5), rx_at_caller.recv())
+			.await
+			.expect("echo never arrived, so the relay path did not run")
+			.expect("reply channel closed before the echo arrived");
+		assert_eq!(&echoed.payload[..], b"wind-test direct callback udp");
+
+		// Closing the local side ends the association; `handle_udp` must
+		// return.
+		drop(tx_to_relay);
+		tokio::time::timeout(Duration::from_secs(5), handle)
+			.await
+			.expect("handle_udp did not return after the local side closed")
+			.expect("handle_udp task panicked")
+			.expect("handle_udp errored");
+
+		// Drain anything the echo round trip delivered late, then require the
+		// channel to be closed. With the reply task aborted before `handle_udp`
+		// returns, its `tx` is gone and the receive resolves to `None`; a
+		// surviving task still owns a `tx`, so this stays pending.
+		while let Ok(Some(_)) = tokio::time::timeout(Duration::from_millis(100), rx_at_caller.recv()).await {}
+		let upstream = tokio::time::timeout(Duration::from_secs(1), rx_at_caller.recv()).await;
+		assert!(
+			matches!(upstream, Ok(None)),
+			"upstream channel outlived handle_udp (got {upstream:?}); the reply relay task is still running"
 		);
 	}
 
