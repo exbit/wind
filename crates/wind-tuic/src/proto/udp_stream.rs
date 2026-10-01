@@ -15,8 +15,8 @@ use wind_quic::QuicConnection;
 
 use crate::{
 	proto::{
-		Address, AddressCodec, ClientProtoExt as _, CmdCodec, CmdType, Command, Header, HeaderCodec, NumericOverflowSnafu,
-		UdpRelayMode,
+		Address, AddressCodec, ClientProtoExt as _, CmdCodec, CmdType, Command, Header, HeaderCodec, UdpRelayMode,
+		check_packet_payload_size,
 	},
 	udp::{DEFAULT_FRAGMENT_TIMEOUT, FragmentInfo, FragmentReassemblyBuffer, MAX_FRAGMENTS},
 };
@@ -89,15 +89,9 @@ impl<C: QuicConnection> UdpStream<C> {
 
 		// The `size` field of a `Packet` command is a `u16`; refuse to send
 		// anything that would silently truncate (reachable in QUIC relay mode,
-		// where a stream carries an arbitrary-length payload).
-		if payload_len > u16::MAX as usize {
-			return Err(NumericOverflowSnafu {
-				field: "TUIC packet payload size",
-				num: payload_len.to_string(),
-			}
-			.build()
-			.into());
-		}
+		// where a stream carries an arbitrary-length payload). `send_udp`
+		// applies the same guard, so both send routes fail identically.
+		check_packet_payload_size(payload_len)?;
 
 		// QUIC relay mode — or a peer that cannot receive DATAGRAM frames —
 		// carries one unidirectional stream per packet, no fragmentation
@@ -861,7 +855,7 @@ mod tests {
 
 		match err.downcast_ref::<crate::proto::ProtoError>() {
 			Some(crate::proto::ProtoError::NumericOverflow { field, num, .. }) => {
-				assert_eq!(field, "TUIC packet payload size");
+				assert_eq!(field, "UDP payload size");
 				assert_eq!(num, &payload_len.to_string());
 			}
 			other => panic!("expected NumericOverflow, got {other:?}"),
