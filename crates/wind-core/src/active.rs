@@ -28,6 +28,12 @@ pub struct ActiveConnections {
 	/// removing entries, so a kicked connection keeps counting until it
 	/// deregisters. Entries are dropped once they reach zero so one-shot
 	/// users cannot grow this map without bound.
+	///
+	/// A host's per-user limit is necessarily best-effort: `count_for` is
+	/// advisory, and a caller that checks it and registers afterwards (no
+	/// caller can hold this map's locks across both steps) leaves a window in
+	/// which peers authenticating together can each observe the same count.
+	/// The tally itself never drifts from `inner` — see the test module.
 	per_user: Arc<DashMap<UserId, usize>>,
 }
 
