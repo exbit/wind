@@ -1,4 +1,9 @@
-use std::{fs::File, net::IpAddr, path::Path};
+use std::{
+	fs::File,
+	net::IpAddr,
+	path::{Path, PathBuf},
+	sync::atomic::{AtomicU64, Ordering},
+};
 
 use memmap2::Mmap;
 
@@ -19,6 +24,24 @@ const FORMAT_VERSION: u32 = 1;
 /// size keeps the rkyv payload aligned to 16 relative to the (page-aligned)
 /// mmap base.
 const HEADER_LEN: usize = 16;
+
+/// Distinguishes the temp files of concurrent builders living in the same
+/// process (see `temp_cache_path`).
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Temp path used to stage a cache write before the atomic rename.
+///
+/// It must sit next to `cache_path` (the rename is only atomic within one
+/// filesystem) and it must be unique per call: a pid alone is not enough,
+/// because two builders in the same process — a second task, or parallel
+/// tests using one cache path — would otherwise write, rename, and delete one
+/// shared temp file out from under each other.
+fn temp_cache_path(cache_path: &Path) -> PathBuf {
+	let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+	let mut tmp_name = cache_path.file_name().unwrap_or_default().to_os_string();
+	tmp_name.push(format!(".tmp.{}.{}", std::process::id(), seq));
+	cache_path.with_file_name(tmp_name)
+}
 
 pub struct GeoData {
 	mmap: Mmap,
@@ -44,9 +67,9 @@ impl GeoData {
 		buf.extend_from_slice(&payload[..]);
 		// Write atomically: a partial write (process killed mid-write) or a
 		// concurrent builder must never leave a truncated cache that a later
-		// `open()` would read. Write to a pid-scoped temp file, then rename it
+		// `open()` would read. Write to a per-call temp file, then rename it
 		// into place (atomic on the same filesystem).
-		let tmp_path = cache_path.with_extension(format!("tmp.{}", std::process::id()));
+		let tmp_path = temp_cache_path(cache_path);
 		std::fs::write(&tmp_path, &buf)?;
 		if let Err(e) = std::fs::rename(&tmp_path, cache_path) {
 			let _ = std::fs::remove_file(&tmp_path);
@@ -100,7 +123,7 @@ impl GeoData {
 
 #[cfg(test)]
 mod tests {
-	use std::net::IpAddr;
+	use std::{net::IpAddr, sync::atomic::AtomicUsize};
 
 	use geosite_rs::{Cidr, Domain, GeoIp, GeoIpList, GeoSite, GeoSiteList, encode_geoip, encode_geosite};
 
@@ -503,5 +526,57 @@ mod tests {
 		let ip = geo.geoip_lookup();
 		assert!(ip("US", "0.0.0.5".parse::<IpAddr>().unwrap()));
 		assert!(!ip("US", "0.0.0.3".parse::<IpAddr>().unwrap()));
+	}
+
+	#[test]
+	fn temp_cache_paths_are_unique_per_call() {
+		// Regression: the temp path was `<cache>.tmp.<pid>`, i.e. identical
+		// for every builder inside one process. Two builders sharing a cache
+		// path then staged their bytes to the same file.
+		let dir = tempfile::tempdir().unwrap();
+		let cache = dir.path().join("geodata.rkyv");
+
+		let first = temp_cache_path(&cache);
+		let second = temp_cache_path(&cache);
+
+		assert_ne!(first, second, "two builders in one process must not share a temp file");
+		// The rename into place only stays atomic while the temp file is on
+		// the cache's own filesystem.
+		assert_eq!(first.parent(), cache.parent());
+		assert_eq!(second.parent(), cache.parent());
+	}
+
+	#[test]
+	fn concurrent_builds_to_one_cache_path_all_succeed() {
+		// End to end counterpart of `temp_cache_paths_are_unique_per_call`:
+		// two real builders racing on one cache path must both keep a usable
+		// handle, and the cache left behind must still be complete.
+		let (gs, gi) = fixture();
+		let dir = tempfile::tempdir().unwrap();
+		let cache = dir.path().join("geodata.rkyv");
+		let barrier = std::sync::Barrier::new(2);
+		let built = AtomicUsize::new(0);
+		let built = &built;
+
+		std::thread::scope(|scope| {
+			for _ in 0..2 {
+				let gs = &gs;
+				let gi = &gi;
+				let cache = &cache;
+				let barrier = &barrier;
+				scope.spawn(move || {
+					barrier.wait();
+					let geo = GeoData::build_and_open(gs, gi, cache).expect("concurrent build must not lose its temp file");
+					assert!(geo.geosite_lookup()("google", "mail.google.com"));
+					assert!(geo.geoip_lookup()("US", "8.8.8.8".parse::<IpAddr>().unwrap()));
+					built.fetch_add(1, Ordering::SeqCst);
+				});
+			}
+		});
+
+		assert_eq!(built.load(Ordering::SeqCst), 2);
+		let reopened = GeoData::open(&cache).unwrap();
+		assert!(reopened.geosite_lookup()("google", "youtube.com"));
+		assert!(reopened.geoip_lookup()("CN", "2400:3200::1".parse::<IpAddr>().unwrap()));
 	}
 }
