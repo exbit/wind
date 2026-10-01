@@ -272,15 +272,46 @@ fn reaped_io_threads() -> usize {
 	REAPED_IO_THREADS.load(Ordering::Acquire)
 }
 
-/// Join a detached-able blocking thread from a thread that is allowed to block.
+/// Name of the bridge I/O thread, as reported by `std::thread::Builder`.
+const BRIDGE_IO_THREAD_NAME: &str = "wind-naive-io";
+
+/// Name of the UoT bridge I/O thread.
+const UOT_IO_THREAD_NAME: &str = "wind-naive-uot-io";
+
+/// Name of the plain thread that joins an I/O thread outside a tokio runtime.
+const REAPER_THREAD_NAME: &str = "wind-naive-reaper";
+
+/// Spawn a bridge I/O thread with an injectable strategy.
 ///
-/// `Drop` runs on an async worker, so it cannot `join` inline: the Cronet
-/// reader may sit in a blocking FFI read for up to its own timeout, and
-/// parking a tokio worker for that long would leak the runtime's capacity.
-/// The reaper lives on a blocking thread (or a plain one outside a runtime),
-/// so the standard thread and the `NaiveConn` it owns — including its socket —
-/// are reclaimed instead of being abandoned by a dropped [`JoinHandle`].
-fn reap_blocking_thread(handle: JoinHandle<()>) {
+/// The bridges run in `Result`-returning functions, so a refused thread —
+/// `EAGAIN` when the OS thread limit, the process limit, or the address space
+/// for the stack is exhausted — must surface as an error instead of unwinding
+/// the task. [`spawn_io_thread`] passes `std::thread::Builder::spawn`; the
+/// strategy is a parameter only so a test can drive the refused-thread path
+/// deterministically, which the OS cannot be asked to do.
+fn spawn_io_thread_with<'a>(
+	name: &str,
+	spawn: impl FnOnce(&str, Box<dyn FnOnce() + Send + 'a>) -> std::io::Result<JoinHandle<()>> + 'a,
+	body: impl FnOnce() + Send + 'a,
+) -> std::io::Result<JoinHandle<()>> {
+	spawn(name, Box::new(body))
+}
+
+/// Spawn one of the bridge I/O threads, reporting a refused thread as an error.
+fn spawn_io_thread(name: &str, body: impl FnOnce() + Send + 'static) -> std::io::Result<JoinHandle<()>> {
+	spawn_io_thread_with(
+		name,
+		|name, body| std::thread::Builder::new().name(name.to_string()).spawn(body),
+		body,
+	)
+}
+
+/// Join `handle` on a thread that is allowed to block, absorbing a refused
+/// reaper thread instead of propagating it.
+fn reap_blocking_thread_with(
+	handle: JoinHandle<()>,
+	spawn: impl FnOnce(&str, Box<dyn FnOnce() + Send + 'static>) -> std::io::Result<JoinHandle<()>>,
+) {
 	if let Ok(runtime) = tokio::runtime::Handle::try_current() {
 		// Detached on purpose: this task only *waits* for `handle`, and it is
 		// the runtime's blocking pool — not a `join()` on an async worker —
@@ -296,11 +327,33 @@ fn reap_blocking_thread(handle: JoinHandle<()>) {
 	} else {
 		// No reactor to hand the wait to; a plain thread keeps the reaping
 		// behaviour identical for callers outside a tokio runtime.
-		let _ = std::thread::Builder::new().name("wind-naive-reaper".into()).spawn(move || {
-			let _ = handle.join();
-			REAPED_IO_THREADS.fetch_add(1, Ordering::AcqRel);
-		});
+		if let Err(e) = spawn(
+			REAPER_THREAD_NAME,
+			Box::new(move || {
+				let _ = handle.join();
+				REAPED_IO_THREADS.fetch_add(1, Ordering::AcqRel);
+			}),
+		) {
+			// Reaping is best-effort: the relay it belongs to is already over,
+			// and panicking here (from `Drop`, possibly during an unwind) would
+			// abort the process instead of merely detaching the thread.
+			tracing::warn!(error = %e, "could not spawn a thread to reap a wind-naive io thread");
+		}
 	}
+}
+
+/// Join a detached-able blocking thread from a thread that is allowed to block.
+///
+/// `Drop` runs on an async worker, so it cannot `join` inline: the Cronet
+/// reader may sit in a blocking FFI read for up to its own timeout, and
+/// parking a tokio worker for that long would leak the runtime's capacity.
+/// The reaper lives on a blocking thread (or a plain one outside a runtime),
+/// so the standard thread and the `NaiveConn` it owns — including its socket —
+/// are reclaimed instead of being abandoned by a dropped [`JoinHandle`].
+fn reap_blocking_thread(handle: JoinHandle<()>) {
+	reap_blocking_thread_with(handle, |name, body| {
+		std::thread::Builder::new().name(name.to_string()).spawn(body)
+	});
 }
 
 /// Owns a bridge's blocking I/O thread for as long as the relay is running.
@@ -362,57 +415,55 @@ async fn naive_uot_bridge(
 	let mut initial = uot::encode_request(&first.target)?;
 	uot::encode_packet_into(&mut initial, &first.target, &first.payload)?;
 
-	let io_handle = std::thread::Builder::new()
-		.name("wind-naive-uot-io".into())
-		.spawn(move || {
-			if naive.write_all(&initial).is_err() {
-				return;
-			}
-			let _ = naive.flush();
+	let io_handle = spawn_io_thread(UOT_IO_THREAD_NAME, move || {
+		if naive.write_all(&initial).is_err() {
+			return;
+		}
+		let _ = naive.flush();
 
+		loop {
+			let mut wrote = false;
 			loop {
-				let mut wrote = false;
-				loop {
-					match uplink_rx.try_recv() {
-						Ok(frame) => {
-							if naive.write_all(&frame).is_err() {
-								return;
-							}
-							wrote = true;
-						}
-						// The relay dropped the uplink sender: stop now instead
-						// of parking in one more read before it notices.
-						Err(mpsc::error::TryRecvError::Disconnected) => return,
-						Err(mpsc::error::TryRecvError::Empty) => break,
-					}
-				}
-				if wrote {
-					let _ = naive.flush();
-				}
-
-				match uot::read_packet(&mut naive) {
-					Ok((source, payload)) => {
-						let packet = UdpPacket {
-							source: Some(source.clone()),
-							target: source,
-							payload: payload.into(),
-						};
-						if downlink_tx.blocking_send(packet).is_err() {
+				match uplink_rx.try_recv() {
+					Ok(frame) => {
+						if naive.write_all(&frame).is_err() {
 							return;
 						}
+						wrote = true;
 					}
-					Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-						tracing::debug!("UoT tunnel EOF");
-						return;
-					}
-					Err(e) => {
-						tracing::debug!(error = %e, "UoT tunnel read error");
+					// The relay dropped the uplink sender: stop now instead
+					// of parking in one more read before it notices.
+					Err(mpsc::error::TryRecvError::Disconnected) => return,
+					Err(mpsc::error::TryRecvError::Empty) => break,
+				}
+			}
+			if wrote {
+				let _ = naive.flush();
+			}
+
+			match uot::read_packet(&mut naive) {
+				Ok((source, payload)) => {
+					let packet = UdpPacket {
+						source: Some(source.clone()),
+						target: source,
+						payload: payload.into(),
+					};
+					if downlink_tx.blocking_send(packet).is_err() {
 						return;
 					}
 				}
+				Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+					tracing::debug!("UoT tunnel EOF");
+					return;
+				}
+				Err(e) => {
+					tracing::debug!(error = %e, "UoT tunnel read error");
+					return;
+				}
 			}
-		})
-		.expect("spawn wind-naive-uot-io thread");
+		}
+	})
+	.context("spawn wind-naive-uot-io thread")?;
 
 	let uplink = async move {
 		while let Some(packet) = rx.recv().await {
@@ -487,48 +538,46 @@ where
 		let (naive_write_tx, mut naive_write_rx) = mpsc::channel::<Vec<u8>>(NAIVE_BRIDGE_QUEUE);
 		let (naive_read_tx, mut naive_read_rx) = mpsc::channel::<Vec<u8>>(NAIVE_BRIDGE_QUEUE);
 
-		let io_handle = std::thread::Builder::new()
-			.name("wind-naive-io".into())
-			.spawn(move || {
-				let mut read_buf = [0u8; 65535];
+		let io_handle = spawn_io_thread(BRIDGE_IO_THREAD_NAME, move || {
+			let mut read_buf = [0u8; 65535];
 
+			loop {
 				loop {
-					loop {
-						match naive_write_rx.try_recv() {
-							Ok(data) => {
-								if naive.write_all(&data).is_err() {
-									return;
-								}
-								let _ = naive.flush();
-							}
-							// The relay dropped the uplink sender: stop now
-							// instead of parking in one more read.
-							Err(mpsc::error::TryRecvError::Disconnected) => return,
-							Err(mpsc::error::TryRecvError::Empty) => break,
-						}
-					}
-
-					match naive.read(&mut read_buf) {
-						Ok(0) => {
-							tracing::debug!("naive conn EOF");
-							return;
-						}
-						Ok(n) => {
-							// I/O thread is sync; use `blocking_send` so back-
-							// pressure naturally stalls reads from `naive`
-							// instead of OOMing the queue.
-							if naive_read_tx.blocking_send(read_buf[..n].to_vec()).is_err() {
+					match naive_write_rx.try_recv() {
+						Ok(data) => {
+							if naive.write_all(&data).is_err() {
 								return;
 							}
+							let _ = naive.flush();
 						}
-						Err(e) => {
-							tracing::debug!(error = %e, "naive conn read error");
+						// The relay dropped the uplink sender: stop now
+						// instead of parking in one more read.
+						Err(mpsc::error::TryRecvError::Disconnected) => return,
+						Err(mpsc::error::TryRecvError::Empty) => break,
+					}
+				}
+
+				match naive.read(&mut read_buf) {
+					Ok(0) => {
+						tracing::debug!("naive conn EOF");
+						return;
+					}
+					Ok(n) => {
+						// I/O thread is sync; use `blocking_send` so back-
+						// pressure naturally stalls reads from `naive`
+						// instead of OOMing the queue.
+						if naive_read_tx.blocking_send(read_buf[..n].to_vec()).is_err() {
 							return;
 						}
 					}
+					Err(e) => {
+						tracing::debug!(error = %e, "naive conn read error");
+						return;
+					}
 				}
-			})
-			.expect("spawn wind-naive-io thread");
+			}
+		})
+		.context("spawn wind-naive-io thread")?;
 
 		let mut local_buf = vec![0u8; 65535];
 
@@ -825,5 +874,70 @@ mod tests {
 			before + 1,
 			"the bridge must join its io thread instead of detaching the handle"
 		);
+	}
+
+	/// A refused bridge I/O thread must be reported through the caller's
+	/// `eyre::Result`, not turned into a task-wide panic.
+	///
+	/// Both bridge spawn sites used `Builder::spawn(..).expect(..)`, which
+	/// unwound as soon as the OS refused a thread. `spawn_io_thread_with` only
+	/// became able to report that as a `Result` in this change, so this
+	/// fails-before: the error path did not exist, and the spawn could not be
+	/// *offered* the refused thread at all.
+	#[test]
+	fn a_refused_io_thread_is_reported_instead_of_panicking() {
+		let mut offered: Vec<String> = Vec::new();
+
+		let e = spawn_io_thread_with(
+			BRIDGE_IO_THREAD_NAME,
+			|name, _body| {
+				offered.push(name.to_string());
+				Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "thread limit reached"))
+			},
+			|| unreachable!("a refused thread must not be started"),
+		)
+		.context("spawn wind-naive-io thread")
+		.expect_err("a refused thread must surface as an error");
+
+		assert!(
+			e.to_string().starts_with("spawn wind-naive-io thread"),
+			"the spawn failure must keep the bridge's context: {e}"
+		);
+		// `eyre` renders only the outermost context with `Display`, but keeps
+		// the refused-thread error as the report's cause, so the operator can
+		// still see *why* the thread was refused.
+		let chain = format!("{e:?}");
+		assert!(
+			chain.contains("thread limit reached"),
+			"the OS error must stay in the report's cause chain: {chain}"
+		);
+		assert_eq!(
+			offered,
+			vec![BRIDGE_IO_THREAD_NAME.to_string()],
+			"the bridge's thread name must be used"
+		);
+	}
+
+	/// Failing to spawn the *reaper* must not panic either: `JoinSession::drop`
+	/// calls it on the async worker's unwind-free path, and a panic there
+	/// aborts the process when the drop is itself running during an unwind.
+	///
+	/// This test runs outside a tokio runtime on purpose — that is the branch
+	/// that spawns the plain reaper thread, and so the only one where the
+	/// refusal has to be absorbed.
+	#[test]
+	fn a_refused_reaper_thread_is_logged_instead_of_panicking() {
+		let (tx, rx) = std::sync::mpsc::channel::<()>();
+		let handle = std::thread::spawn(move || {
+			let _ = tx.send(());
+		});
+		let _ = rx.recv_timeout(std::time::Duration::from_secs(5));
+
+		let attempted = std::cell::Cell::new(false);
+		reap_blocking_thread_with(handle, |_name, _body| {
+			attempted.set(true);
+			Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "thread limit reached"))
+		});
+		assert!(attempted.get(), "the reaper must have attempted its plain spawn");
 	}
 }
