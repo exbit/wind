@@ -1205,6 +1205,68 @@ mod tests {
 			Ok(())
 		}
 
+		/// W45: the quiche server offers `ConnectionOpts::alpn` during the TLS
+		/// handshake; a client that provides the same list completes the
+		/// handshake and authenticates.
+		#[tokio::test]
+		async fn quiche_server_offers_the_configured_alpn() -> eyre::Result<()> {
+			let uuid = Uuid::new_v4();
+			let password = "test-password";
+			let server_opts = ConnectionOpts {
+				alpn: vec![b"tuic-test".to_vec()],
+				..Default::default()
+			};
+			let (addr, _dir) = start_echo_server(uuid, password, server_opts).await?;
+
+			let outbound = client_builder(addr, uuid, password, TransportUdpRelayMode::Datagram)
+				.alpn(vec![b"tuic-test".to_vec()])
+				.build()
+				.await?;
+			outbound.close();
+			Ok(())
+		}
+
+		/// The mirror image: the server offers only `tuic-test`, the client
+		/// only `h3`. With no protocol in common the handshake can
+		/// never complete, so dialing must fail. Before W45 the server
+		/// discarded its own ALPN list and always offered `h3`, so this
+		/// client authenticated successfully — proving the server-side
+		/// ALPN was not actually enforced.
+		#[tokio::test]
+		async fn quiche_server_rejects_a_client_without_a_common_alpn() -> eyre::Result<()> {
+			let uuid = Uuid::new_v4();
+			let password = "test-password";
+			let server_opts = ConnectionOpts {
+				alpn: vec![b"tuic-test".to_vec()],
+				..Default::default()
+			};
+			let (addr, _dir) = start_echo_server(uuid, password, server_opts).await?;
+
+			// A mismatched ALPN surfaces as quiche giving up on the handshake
+			// (quiche reports `timed out`), not as a distinct ALPN error, so
+			// bound the dial and require a failure rather than a connection.
+			let built = tokio::time::timeout(
+				Duration::from_secs(20),
+				client_builder(addr, uuid, password, TransportUdpRelayMode::Datagram).build(),
+			)
+			.await
+			.expect("a server that enforces ALPN must never leave the dial hanging");
+
+			// `TuicheOutbound` is deliberately not `Debug`, so match instead of
+			// `expect_err`.
+			match built {
+				Ok(outbound) => {
+					outbound.close();
+					eyre::bail!("a client offering only `h3` authenticated to a server offering only `tuic-test`")
+				}
+				Err(err) => assert!(
+					format!("{err}").contains("timed out"),
+					"expected the handshake to time out with no common ALPN, got: {err}"
+				),
+			}
+			Ok(())
+		}
+
 		/// Control: the default (datagram) relay mode still round-trips when
 		/// both transports advertise DATAGRAM support.
 		#[tokio::test]

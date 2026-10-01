@@ -297,6 +297,13 @@ impl TuicheInboundBuilder {
 		self
 	}
 
+	/// Set the ALPN protocols the server offers during the TLS handshake.
+	/// Defaults to `["h3"]`; entries are used verbatim (no `h3` is injected).
+	pub fn alpn(mut self, alpn: Vec<Vec<u8>>) -> Self {
+		self.opts.alpn = alpn;
+		self
+	}
+
 	/// Build the server. Reads the certificate and key files to seed the
 	/// hot-swappable [`CertStore`]; both paths are required.
 	pub async fn build(self) -> Result<TuicheInbound> {
