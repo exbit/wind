@@ -1,4 +1,4 @@
-use std::cmp::Ordering;
+use std::{cmp::Ordering, ops::Range};
 
 use rkyv::{Archived, vec::ArchivedVec};
 
@@ -6,18 +6,24 @@ use crate::snapshot::*;
 
 impl ArchivedGeoDataSnapshot {
 	/// Verify every category/country slice `[start, start + len)` lies within
-	/// its backing vector, and that the name lists are sorted for the binary
-	/// searches. rkyv's structural check does not cover these application-level
-	/// invariants, so a corrupt or bit-flipped cache that still passes it could
-	/// otherwise drive an out-of-bounds index panic on every query (DoS).
+	/// its backing vector, that the name lists are sorted for the binary
+	/// searches, and that each domain/range slice itself carries the order the
+	/// queries rely on. rkyv's structural check does not cover these
+	/// application-level invariants, so a corrupt or bit-flipped cache that
+	/// still passes it could otherwise drive an out-of-bounds index panic on
+	/// every query (DoS) or, for an unordered slice, silently answer with wrong
+	/// match results.
 	pub fn validate_offsets(&self) -> Result<(), String> {
 		let gs = &self.geosite;
 		let (ex, sf, kw) = (gs.exact_domains.len(), gs.suffix_domains.len(), gs.keyword_domains.len());
 		let mut prev: Option<&str> = None;
 		for c in gs.categories.iter() {
-			check_slice(c.exact_start.to_native(), c.exact_len.to_native(), ex, "geosite exact")?;
-			check_slice(c.suffix_start.to_native(), c.suffix_len.to_native(), sf, "geosite suffix")?;
-			check_slice(c.keyword_start.to_native(), c.keyword_len.to_native(), kw, "geosite keyword")?;
+			let exact = check_slice(c.exact_start.to_native(), c.exact_len.to_native(), ex, "geosite exact")?;
+			check_ascending(&gs.exact_domains, exact, "geosite exact domains")?;
+			let suffix = check_slice(c.suffix_start.to_native(), c.suffix_len.to_native(), sf, "geosite suffix")?;
+			check_ascending(&gs.suffix_domains, suffix, "geosite suffix domains")?;
+			let keyword = check_slice(c.keyword_start.to_native(), c.keyword_len.to_native(), kw, "geosite keyword")?;
+			check_ascending(&gs.keyword_domains, keyword, "geosite keyword domains")?;
 			let name = c.name.as_str();
 			if let Some(p) = prev
 				&& p > name
@@ -31,8 +37,16 @@ impl ArchivedGeoDataSnapshot {
 		let (v4, v6) = (gi.v4_ranges.len(), gi.v6_ranges.len());
 		let mut prev: Option<&str> = None;
 		for c in gi.countries.iter() {
-			check_slice(c.v4_start.to_native(), c.v4_len.to_native(), v4, "geoip v4")?;
-			check_slice(c.v6_start.to_native(), c.v6_len.to_native(), v6, "geoip v6")?;
+			let v4_slice = check_slice(c.v4_start.to_native(), c.v4_len.to_native(), v4, "geoip v4")?;
+			check_ranges(v4_slice, "geoip v4", |i| {
+				let r = &gi.v4_ranges[i];
+				(r.start.to_native(), r.end.to_native())
+			})?;
+			let v6_slice = check_slice(c.v6_start.to_native(), c.v6_len.to_native(), v6, "geoip v6")?;
+			check_ranges(v6_slice, "geoip v6", |i| {
+				let r = &gi.v6_ranges[i];
+				(r.start.to_native(), r.end.to_native())
+			})?;
 			let name = c.name.as_str();
 			if let Some(p) = prev
 				&& p > name
@@ -45,12 +59,57 @@ impl ArchivedGeoDataSnapshot {
 	}
 }
 
-fn check_slice(start: u32, len: u32, total: usize, what: &str) -> Result<(), String> {
-	let end = (start as usize)
+/// Validate a `[start, start + len)` slice against a backing vector length and
+/// return it as a `usize` range for the caller's ordering check.
+fn check_slice(start: u32, len: u32, total: usize, what: &str) -> Result<Range<usize>, String> {
+	let start = start as usize;
+	let end = start
 		.checked_add(len as usize)
 		.ok_or_else(|| format!("{what} slice offset overflow"))?;
 	if end > total {
 		return Err(format!("{what} slice [{start}, {end}) out of bounds (backing len {total})"));
+	}
+	Ok(start..end)
+}
+
+/// Verify one category's slice of domain names is strictly ascending. The
+/// builder sorts and dedups every list and the queries binary-search it, so an
+/// out-of-order slice would silently miss entries instead of failing.
+fn check_ascending(v: &ArchivedVec<Archived<String>>, slice: Range<usize>, what: &str) -> Result<(), String> {
+	let mut prev: Option<&str> = None;
+	for i in slice {
+		let cur = v[i].as_str();
+		if let Some(p) = prev
+			&& p >= cur
+		{
+			return Err(format!("{what} not sorted: {p:?} before {cur:?}"));
+		}
+		prev = Some(cur);
+	}
+	Ok(())
+}
+
+/// Verify one country's slice of ranges is ascending and disjoint. The queries
+/// binary-search for the last range whose `start <= addr` and then assume at
+/// most one range can contain `addr`, so overlapping or out-of-order ranges
+/// would silently produce wrong answers.
+fn check_ranges<T: Ord + std::fmt::Debug + Copy>(
+	slice: Range<usize>,
+	what: &str,
+	get: impl Fn(usize) -> (T, T),
+) -> Result<(), String> {
+	let mut prev_end: Option<T> = None;
+	for i in slice {
+		let (start, end) = get(i);
+		if end < start {
+			return Err(format!("{what} has an inverted range: {start:?} > {end:?}"));
+		}
+		if let Some(pe) = prev_end
+			&& start <= pe
+		{
+			return Err(format!("{what} ranges not sorted/disjoint: {start:?} after {pe:?}"));
+		}
+		prev_end = Some(end);
 	}
 	Ok(())
 }

@@ -353,4 +353,155 @@ mod tests {
 		std::fs::write(tmp.path(), &buf).unwrap();
 		assert!(matches!(GeoData::open(tmp.path()), Err(GeoDataError::Validate(_))));
 	}
+
+	/// Serialise `snapshot` behind a valid header into a temporary cache file.
+	fn write_cache(snapshot: &crate::snapshot::GeoDataSnapshot) -> tempfile::NamedTempFile {
+		let payload = rkyv::api::high::to_bytes::<rkyv::rancor::Error>(snapshot).unwrap();
+		let mut buf = Vec::new();
+		buf.extend_from_slice(&MAGIC);
+		buf.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+		buf.extend_from_slice(&[0u8; 4]);
+		buf.extend_from_slice(&payload[..]);
+
+		let tmp = tempfile::NamedTempFile::new().unwrap();
+		std::fs::write(tmp.path(), &buf).unwrap();
+		tmp
+	}
+
+	/// A snapshot with no geosite data and one country holding `v4_ranges`.
+	fn geoip_snapshot(v4_ranges: Vec<crate::snapshot::RangeV4>) -> crate::snapshot::GeoDataSnapshot {
+		use crate::snapshot::{CountryInfo, GeoDataSnapshot, GeoIpIndex, GeoSiteIndex};
+
+		GeoDataSnapshot {
+			geosite: GeoSiteIndex {
+				categories: Vec::new(),
+				exact_domains: Vec::new(),
+				suffix_domains: Vec::new(),
+				keyword_domains: Vec::new(),
+			},
+			geoip: GeoIpIndex {
+				countries: vec![CountryInfo {
+					name: "EVIL".to_string(),
+					v4_start: 0,
+					v4_len: v4_ranges.len() as u32,
+					v6_start: 0,
+					v6_len: 0,
+				}],
+				v4_ranges,
+				v6_ranges: Vec::new(),
+			},
+		}
+	}
+
+	#[test]
+	fn open_rejects_unsorted_domain_slice() {
+		use crate::snapshot::{CategoryInfo, CountryInfo, GeoDataSnapshot, GeoIpIndex, GeoSiteIndex};
+
+		// In bounds and structurally sound, but the category's exact-domain
+		// slice is out of order. Every query binary-searches that slice, so a
+		// cache like this would silently miss entries instead of being
+		// rejected.
+		let snapshot = GeoDataSnapshot {
+			geosite: GeoSiteIndex {
+				categories: vec![CategoryInfo {
+					name: "EVIL".to_string(),
+					exact_start: 0,
+					exact_len: 2,
+					suffix_start: 0,
+					suffix_len: 0,
+					keyword_start: 0,
+					keyword_len: 0,
+				}],
+				exact_domains: vec!["b.example".to_string(), "a.example".to_string()],
+				suffix_domains: Vec::new(),
+				keyword_domains: Vec::new(),
+			},
+			geoip: GeoIpIndex {
+				countries: Vec::<CountryInfo>::new(),
+				v4_ranges: Vec::new(),
+				v6_ranges: Vec::new(),
+			},
+		};
+
+		let tmp = write_cache(&snapshot);
+		assert!(matches!(
+			GeoData::open(tmp.path()),
+			Err(GeoDataError::Validate(msg)) if msg.contains("geosite exact domains not sorted")
+		));
+	}
+
+	#[test]
+	fn open_rejects_overlapping_or_inverted_ranges() {
+		use crate::snapshot::RangeV4;
+
+		// `range_contains_v4` finds the last range whose start <= addr and
+		// assumes at most one range can contain the address. Overlapping,
+		// descending, or inverted ranges break that assumption silently.
+		let cases: [(&str, Vec<RangeV4>); 3] = [
+			(
+				"overlapping",
+				vec![RangeV4 { start: 10, end: 20 }, RangeV4 { start: 15, end: 25 }],
+			),
+			(
+				"descending",
+				vec![RangeV4 { start: 30, end: 40 }, RangeV4 { start: 10, end: 20 }],
+			),
+			("inverted", vec![RangeV4 { start: 20, end: 10 }]),
+		];
+
+		for (what, ranges) in cases {
+			let tmp = write_cache(&geoip_snapshot(ranges));
+			assert!(
+				matches!(GeoData::open(tmp.path()), Err(GeoDataError::Validate(_))),
+				"{what} ranges must be rejected"
+			);
+		}
+	}
+
+	#[test]
+	fn open_accepts_ordered_slices() {
+		use crate::snapshot::{CategoryInfo, CountryInfo, GeoDataSnapshot, GeoIpIndex, GeoSiteIndex, RangeV4};
+
+		// Positive control: the invariants the ordering checks demand (sorted
+		// domains, ranges sorted by start and disjoint) must still open and
+		// answer queries.
+		let snapshot = GeoDataSnapshot {
+			geosite: GeoSiteIndex {
+				categories: vec![CategoryInfo {
+					name: "GOOGLE".to_string(),
+					exact_start: 0,
+					exact_len: 2,
+					suffix_start: 0,
+					suffix_len: 1,
+					keyword_start: 0,
+					keyword_len: 1,
+				}],
+				exact_domains: vec!["a.example".to_string(), "b.example".to_string()],
+				suffix_domains: vec!["c.example".to_string()],
+				keyword_domains: vec!["d".to_string()],
+			},
+			geoip: GeoIpIndex {
+				countries: vec![CountryInfo {
+					name: "US".to_string(),
+					v4_start: 0,
+					v4_len: 2,
+					v6_start: 0,
+					v6_len: 0,
+				}],
+				v4_ranges: vec![RangeV4 { start: 1, end: 2 }, RangeV4 { start: 5, end: 9 }],
+				v6_ranges: Vec::new(),
+			},
+		};
+
+		let tmp = write_cache(&snapshot);
+		let geo = GeoData::open(tmp.path()).unwrap();
+		let site = geo.geosite_lookup();
+		assert!(site("google", "a.example"));
+		assert!(site("google", "sub.c.example"));
+		assert!(site("google", "xxdxx"));
+		assert!(!site("google", "z.example"));
+		let ip = geo.geoip_lookup();
+		assert!(ip("US", "0.0.0.5".parse::<IpAddr>().unwrap()));
+		assert!(!ip("US", "0.0.0.3".parse::<IpAddr>().unwrap()));
+	}
 }
