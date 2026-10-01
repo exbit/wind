@@ -14,7 +14,10 @@ type UdpPacketTx = MAsyncTx<mpmc::Array<UdpPacket>>;
 use wind_quic::QuicConnection;
 
 use crate::{
-	proto::{Address, AddressCodec, ClientProtoExt as _, CmdCodec, CmdType, Command, Header, HeaderCodec, UdpRelayMode},
+	proto::{
+		Address, AddressCodec, ClientProtoExt as _, CmdCodec, CmdType, Command, Header, HeaderCodec, NumericOverflowSnafu,
+		UdpRelayMode,
+	},
 	udp::{DEFAULT_FRAGMENT_TIMEOUT, FragmentInfo, FragmentReassemblyBuffer, MAX_FRAGMENTS},
 };
 
@@ -88,7 +91,12 @@ impl<C: QuicConnection> UdpStream<C> {
 		// anything that would silently truncate (reachable in QUIC relay mode,
 		// where a stream carries an arbitrary-length payload).
 		if payload_len > u16::MAX as usize {
-			return Err(eyre::eyre!("TUIC packet exceeds UDP size limit"));
+			return Err(NumericOverflowSnafu {
+				field: "TUIC packet payload size",
+				num: payload_len.to_string(),
+			}
+			.build()
+			.into());
 		}
 
 		// QUIC relay mode — or a peer that cannot receive DATAGRAM frames —
@@ -824,6 +832,45 @@ mod tests {
 		let (_, decoded_target, decoded_payload) = decode_packet_frame(&streams[0]);
 		assert_eq!(decoded_target, target);
 		assert_eq!(decoded_payload, &payload[..]);
+	}
+
+	// -----------------------------------------------------------------------
+	// Oversize guard (W36/W42): the `size` field of a `Packet` command is a
+	// `u16`. A larger payload must be refused with the numeric overflow named,
+	// rather than truncated or sent as a frame whose `size` disagrees with the
+	// bytes that follow it.
+	// -----------------------------------------------------------------------
+
+	/// Regression (W36): the guard reports a `NumericOverflow` naming the
+	/// offending field and value, and nothing reaches the wire.
+	#[tokio::test]
+	async fn oversized_payload_is_rejected_as_a_numeric_overflow() {
+		let conn = RecordingConn::new(Some(1200));
+		let stream = recording_stream(&conn, UdpRelayMode::Native);
+		let target = TargetAddr::IPv4(Ipv4Addr::new(127, 0, 0, 1), 5353);
+		let payload_len = u16::MAX as usize + 1;
+
+		let err = stream
+			.send_packet(UdpPacket {
+				source: None,
+				target,
+				payload: Bytes::from(vec![0xABu8; payload_len]),
+			})
+			.await
+			.expect_err("a payload that does not fit `size` must be refused");
+
+		match err.downcast_ref::<crate::proto::ProtoError>() {
+			Some(crate::proto::ProtoError::NumericOverflow { field, num, .. }) => {
+				assert_eq!(field, "TUIC packet payload size");
+				assert_eq!(num, &payload_len.to_string());
+			}
+			other => panic!("expected NumericOverflow, got {other:?}"),
+		}
+		assert!(conn.datagrams().is_empty(), "a refused packet must not be sent as a datagram");
+		assert!(
+			conn.uni_streams().is_empty(),
+			"a refused packet must not be sent on a uni stream"
+		);
 	}
 
 	// -----------------------------------------------------------------------
