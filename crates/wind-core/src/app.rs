@@ -58,6 +58,9 @@ pub struct App<R: Router> {
 	/// of a private one created inside [`App::run`].
 	stats_collector: Option<Arc<StatsCollector>>,
 	flush_interval: Duration,
+	/// Explicit cadence for the inbounds' traffic sampler. `None` keeps the
+	/// historic behavior of following [`App::set_flush_interval`].
+	sample_interval: Option<Duration>,
 	shutdown_timeout: Duration,
 	inbounds: Vec<InboundFactory<R>>,
 }
@@ -80,6 +83,7 @@ impl<R: Router> App<R> {
 			traffic_sink: None,
 			stats_collector: None,
 			flush_interval: Duration::from_secs(60),
+			sample_interval: None,
 			shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
 			inbounds: Vec::new(),
 		}
@@ -141,9 +145,30 @@ impl<R: Router> App<R> {
 		self
 	}
 
-	/// Flush/sample cadence for traffic stats (default 60s).
+	/// Cadence for the periodic traffic-stats flush to the sink (default 60s).
+	///
+	/// This also sets the inbounds' traffic-sampler cadence
+	/// ([`InboundHooks::sample_interval`]) unless it is given its own value
+	/// with [`App::set_sample_interval`] — the historic coupling, kept so
+	/// existing callers keep their behavior. Set
+	/// [`App::set_sample_interval`] when the sampling window and the
+	/// reporting window should differ (they pull in opposite directions: a
+	/// short flush window bounds reporting latency, while a short sampling
+	/// window only adds `byte_stats()` polling overhead).
 	pub fn set_flush_interval(mut self, interval: Duration) -> Self {
 		self.flush_interval = interval;
+		self
+	}
+
+	/// Cadence at which each inbound samples traffic into the shared
+	/// [`StatsCollector`] (default: whatever [`App::set_flush_interval`] is,
+	/// itself 60s by default).
+	///
+	/// Sampling is independent of the flush task: samples accumulate in the
+	/// collector until the next flush reports them, so this never changes what
+	/// is reported, only how finely a connection's traffic is sampled.
+	pub fn set_sample_interval(mut self, interval: Duration) -> Self {
+		self.sample_interval = Some(interval);
 		self
 	}
 
@@ -185,6 +210,7 @@ impl<R: Router> App<R> {
 			traffic_sink,
 			stats_collector,
 			flush_interval,
+			sample_interval,
 			shutdown_timeout,
 			inbounds,
 		} = self;
@@ -210,7 +236,9 @@ impl<R: Router> App<R> {
 			userpass_auth,
 			connection,
 			stats: stats.clone(),
-			sample_interval: flush_interval,
+			// An explicit sampler cadence wins; otherwise keep the historic
+			// coupling to the flush interval.
+			sample_interval: sample_interval.unwrap_or(flush_interval),
 		};
 
 		let mut dispatcher = Dispatcher::new(router).context(ctx.clone());
@@ -491,6 +519,52 @@ mod tests {
 		assert!(
 			hooks.stats.is_none(),
 			"stats stay disabled without a sink or an injected collector"
+		);
+	}
+
+	/// The historic coupling: without an explicit sampler cadence, the flush
+	/// interval still drives sampling, so existing callers keep their behavior.
+	#[tokio::test]
+	async fn flush_interval_still_drives_the_sampler_when_sample_interval_is_unset() {
+		let hooks = run_and_capture_hooks(App::new().set_router(StubRouter).set_flush_interval(Duration::from_secs(7))).await;
+
+		assert_eq!(
+			hooks.sample_interval,
+			Duration::from_secs(7),
+			"an unset sample interval must keep following the flush interval"
+		);
+	}
+
+	/// Regression (W33): setting the flush interval must not silently move the
+	/// sampler once the sampler has its own cadence.
+	#[tokio::test]
+	async fn sample_interval_is_independent_of_the_flush_interval() {
+		let hooks = run_and_capture_hooks(
+			App::new()
+				.set_router(StubRouter)
+				.set_sample_interval(Duration::from_secs(5))
+				.set_flush_interval(Duration::from_secs(3600)),
+		)
+		.await;
+
+		assert_eq!(
+			hooks.sample_interval,
+			Duration::from_secs(5),
+			"the flush interval must not override an explicit sampler cadence"
+		);
+	}
+
+	#[test]
+	fn default_sample_interval_stays_at_sixty_seconds() {
+		assert_eq!(
+			App::<StubRouter>::new().sample_interval,
+			None,
+			"an unset sampler cadence is what preserves the historic flush-interval coupling"
+		);
+		assert_eq!(
+			App::<StubRouter>::new().flush_interval,
+			Duration::from_secs(60),
+			"the pre-W33 sampler cadence is the backward-compatible default"
 		);
 	}
 
