@@ -144,6 +144,9 @@ impl TuicheOutbound {
 		if opts.gc_interval.is_zero() {
 			return Err(eyre::eyre!("TUIC GC interval must be positive"));
 		}
+		if opts.gc_lifetime.is_zero() {
+			return Err(eyre::eyre!("TUIC GC lifetime must be positive"));
+		}
 
 		let token = ctx.token.child_token();
 		let session: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));

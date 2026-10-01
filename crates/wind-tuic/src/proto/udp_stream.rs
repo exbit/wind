@@ -28,12 +28,10 @@ pub struct UdpStream<C: QuicConnection> {
 	assoc_id: u16,
 	receive_tx: UdpPacketTx,
 	next_pkt_id: AtomicU16,
-	// Fragment reassembly state machine (backend-agnostic).
+	/// Fragment reassembly state machine (backend-agnostic).
 	fragment_buffer: FragmentReassemblyBuffer,
 	/// How outgoing `Packet` commands are carried (datagrams or uni streams).
 	relay_mode: UdpRelayMode,
-	/// Lifetime after which incomplete fragment groups are evicted.
-	gc_lifetime: Duration,
 }
 
 impl<C: QuicConnection> UdpStream<C> {
@@ -43,9 +41,8 @@ impl<C: QuicConnection> UdpStream<C> {
 			assoc_id,
 			receive_tx,
 			next_pkt_id: AtomicU16::new(0),
-			fragment_buffer: FragmentReassemblyBuffer::new(),
+			fragment_buffer: FragmentReassemblyBuffer::new(DEFAULT_FRAGMENT_TIMEOUT),
 			relay_mode: UdpRelayMode::Native,
-			gc_lifetime: DEFAULT_FRAGMENT_TIMEOUT,
 		}
 	}
 
@@ -73,8 +70,13 @@ impl<C: QuicConnection> UdpStream<C> {
 
 	/// Configure how long incomplete fragment groups are retained before
 	/// [`collect_garbage`](Self::collect_garbage) evicts them.
+	///
+	/// The lifetime is applied by rebuilding the reassembly buffer: it is fixed
+	/// when the buffer is created, so a lifetime that only reached
+	/// `collect_garbage` could never take effect. Callers set it during
+	/// construction, before any fragment arrives.
 	pub fn with_gc_lifetime(mut self, lifetime: Duration) -> Self {
-		self.gc_lifetime = lifetime;
+		self.fragment_buffer = FragmentReassemblyBuffer::new(lifetime);
 		self
 	}
 
@@ -315,7 +317,24 @@ impl<C: QuicConnection> UdpStream<C> {
 	}
 
 	pub async fn collect_garbage(&self) {
-		self.fragment_buffer.cleanup_expired(self.gc_lifetime).await;
+		self.fragment_buffer.cleanup_expired().await;
+	}
+
+	/// Number of incomplete fragment groups this session is tracking.
+	///
+	/// Test-only: how many groups a peer can pin is a resource-exhaustion
+	/// property, and the tests assert it directly rather than through logs.
+	#[cfg(test)]
+	pub(crate) async fn incomplete_group_count(&self) -> usize {
+		self.fragment_buffer.incomplete_group_count().await
+	}
+
+	/// As [`incomplete_group_count`](Self::incomplete_group_count), but without
+	/// running eviction first — lets a test observe what the periodic GC alone
+	/// achieved. Test-only.
+	#[cfg(test)]
+	pub(crate) fn incomplete_group_count_without_cleanup(&self) -> usize {
+		self.fragment_buffer.incomplete_group_count_without_cleanup()
 	}
 
 	pub async fn close(&mut self) -> Result<(), crate::Error> {
@@ -582,6 +601,34 @@ mod tests {
 	fn recording_stream(conn: &RecordingConn, mode: UdpRelayMode) -> UdpStream<RecordingConn> {
 		let (tx, _rx) = crossfire::mpmc::bounded_async::<UdpPacket>(8);
 		UdpStream::new(conn.clone(), TEST_ASSOC_ID, tx).with_relay_mode(mode)
+	}
+
+	/// F17 regression on the wiring layer: `with_gc_lifetime` must actually
+	/// reach the reassembly buffer's per-group lifetime, otherwise
+	/// `collect_garbage` is a no-op and incomplete groups are pinned for the
+	/// association's lifetime.
+	#[tokio::test]
+	async fn collect_garbage_evicts_groups_past_the_configured_lifetime() {
+		let conn = RecordingConn::new(Some(1200));
+		let (tx, _rx) = crossfire::mpmc::bounded_async::<UdpPacket>(8);
+		let lifetime = Duration::from_millis(100);
+		let stream = UdpStream::new(conn, TEST_ASSOC_ID, tx).with_gc_lifetime(lifetime);
+		let target = TargetAddr::IPv4(Ipv4Addr::new(127, 0, 0, 1), 5353);
+
+		let incomplete = stream
+			.process_fragment(TEST_ASSOC_ID, 7, 3, 0, Bytes::from_static(b"partial"), None, target)
+			.await;
+		assert!(incomplete.is_none(), "one fragment of three must not complete");
+		assert_eq!(stream.incomplete_group_count().await, 1, "the incomplete group is tracked");
+
+		tokio::time::sleep(lifetime * 2).await;
+		stream.collect_garbage().await;
+
+		assert_eq!(
+			stream.incomplete_group_count().await,
+			0,
+			"collect_garbage must evict a group past its configured lifetime"
+		);
 	}
 
 	/// Decode a wire `Packet` frame as produced by `send_udp` /

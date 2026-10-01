@@ -208,6 +208,16 @@ impl<C: QuicConnection> Clone for UdpSession<C> {
 /// would let one authenticated peer pin a large amount of background work.
 const MAX_UDP_SESSIONS_PER_CONN: u64 = 1024;
 
+/// How often a UDP session sweeps its fragment reassembly buffer.
+///
+/// The server has no GC configuration knob (unlike both client outbounds), so
+/// this is a fixed period; the lifetime that actually decides eviction is
+/// [`DEFAULT_FRAGMENT_TIMEOUT`](crate::udp::DEFAULT_FRAGMENT_TIMEOUT) (30 s),
+/// measured per group from its last fragment. Without a tick the buffer would
+/// only ever shrink under capacity pressure, so an incomplete group would stay
+/// pinned for the association's lifetime.
+const UDP_FRAGMENT_GC_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Per-connection senders for the lazily-started HTTP/3 masquerade. The
 /// per-stream router pushes streams it classified as h3 here; `run_masquerade`
 /// (spawned parked) pulls them after `go` fires on the first one. `None`
@@ -983,6 +993,38 @@ async fn handle_udp_packet<C: QuicConnection, CB: InboundCallback + Clone>(
 	Ok(())
 }
 
+/// Drive one UDP session's fragment-reassembly GC.
+///
+/// Runs until `cancel` fires (the session's own token, so it always dies with
+/// the session) or the session's `UdpStream` is gone. The weak handle matters:
+/// if the session-creation future is cancelled before moka admits the entry,
+/// nothing else holds the session's cancel token, and a strong handle would
+/// keep both the stream and this task alive forever.
+///
+/// `interval` is a parameter rather than the constant directly so the
+/// regression test can exercise eviction without a multi-second wait.
+async fn run_udp_fragment_gc<C: QuicConnection>(
+	stream: std::sync::Weak<UdpStream<C>>,
+	cancel: CancellationToken,
+	interval: Duration,
+) {
+	let mut gc_interval = tokio::time::interval(interval);
+	gc_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+	gc_interval.tick().await; // The first tick resolves immediately.
+	loop {
+		tokio::select! {
+			biased;
+			_ = cancel.cancelled() => break,
+			_ = gc_interval.tick() => {
+				match stream.upgrade() {
+					Some(stream) => stream.collect_garbage().await,
+					None => break,
+				}
+			},
+		}
+	}
+}
+
 /// Get an existing UDP session for `assoc_id` or create a new one.
 async fn get_or_create_session<C: QuicConnection, CB: InboundCallback + Clone>(
 	ctx: &Arc<InboundCtx<C>>,
@@ -1070,6 +1112,15 @@ async fn get_or_create_session<C: QuicConnection, CB: InboundCallback + Clone>(
 					}
 				}
 				.in_current_span(),
+			);
+
+			// Fragment-reassembly GC for this session. Without it the buffer
+			// only ever shrinks under capacity pressure, so an incomplete group
+			// stays pinned for the association's lifetime. A weak handle keeps
+			// the task from pinning the session if this insert is cancelled.
+			tokio::spawn(
+				run_udp_fragment_gc(Arc::downgrade(&tuic_stream), session_cancel.clone(), UDP_FRAGMENT_GC_INTERVAL)
+					.in_current_span(),
 			);
 
 			{
@@ -1199,6 +1250,7 @@ async fn handle_dissociate<C: QuicConnection>(connection: &InboundCtx<C>, assoc_
 mod tests {
 	use std::{
 		future, io,
+		net::Ipv4Addr,
 		pin::Pin,
 		sync::{
 			Arc,
@@ -1207,6 +1259,7 @@ mod tests {
 		task::{Context, Poll},
 	};
 
+	use bytes::Bytes;
 	use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 	use wind_core::{InboundCallback, udp::UdpStream as CoreUdpStream};
 	use wind_quic::{QuicRecvStream, QuicSendStream};
@@ -1442,6 +1495,51 @@ mod tests {
 			.await
 			.expect("UDP callback future was not dropped after teardown");
 		assert!(was_dropped.load(Ordering::SeqCst));
+	}
+
+	/// F17/W10: the session GC task must actually evict a group that outlived
+	/// the fragment lifetime. Before this, the server never ticked
+	/// `collect_garbage` at all, so `DEFAULT_FRAGMENT_TIMEOUT` was dead on the
+	/// server side and an incomplete group stayed pinned until the association
+	/// was dissociated.
+	#[tokio::test]
+	async fn udp_fragment_gc_evicts_groups_past_the_fragment_lifetime() {
+		let lifetime = Duration::from_millis(50);
+		let (tx, _rx) = crossfire::mpmc::bounded_async::<UdpPacket>(8);
+		let stream = Arc::new(UdpStream::new(DummyConn, 7, tx).with_gc_lifetime(lifetime));
+		let target = wind_core::types::TargetAddr::IPv4(Ipv4Addr::new(127, 0, 0, 1), 8080);
+
+		// One fragment of two: tracked, but never completed.
+		let incomplete = stream
+			.process_fragment(7, 1, 2, 0, Bytes::from_static(b"AA"), None, target)
+			.await;
+		assert!(incomplete.is_none());
+		assert_eq!(
+			stream.incomplete_group_count_without_cleanup(),
+			1,
+			"the incomplete group must be tracked"
+		);
+
+		// Only the periodic task may evict it: the polling below never calls
+		// cleanup itself, so an expired group can only disappear if the tick
+		// fired.
+		let cancel = CancellationToken::new();
+		let gc = tokio::spawn(run_udp_fragment_gc(
+			Arc::downgrade(&stream),
+			cancel.clone(),
+			Duration::from_millis(10),
+		));
+
+		let evicted = tokio::time::timeout(Duration::from_secs(5), async {
+			while stream.incomplete_group_count_without_cleanup() != 0 {
+				tokio::time::sleep(Duration::from_millis(10)).await;
+			}
+		})
+		.await;
+		cancel.cancel();
+		gc.await.expect("GC task panicked");
+
+		evicted.expect("the server-side GC never evicted a stale fragment group");
 	}
 
 	/// Cancellation must interrupt an accept that is parked forever. This is
