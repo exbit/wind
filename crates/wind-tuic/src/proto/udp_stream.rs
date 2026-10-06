@@ -363,7 +363,10 @@ impl<C: QuicConnection> UdpStream<C> {
 /// drops both channel halves, removes the association from `udp_session`, and
 /// lets the caller re-create it on the current connection.
 ///
-/// Both backends use this so quinn and quiche cannot drift apart here.
+/// Both backends use this so quinn and quiche cannot drift apart here. A
+/// codec-only build (`encode` without either backend) compiles this module but
+/// has no caller for it.
+#[cfg_attr(not(any(feature = "quinn", feature = "quiche")), allow(dead_code))]
 pub(crate) async fn forward_remote_packet<C: QuicConnection>(
 	stream: &UdpStream<C>,
 	packet: UdpPacket,
